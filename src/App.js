@@ -391,6 +391,14 @@ export default function App() {
       return { ...prev, sellOffers: { ...prev.sellOffers, [radId]: { ...offer, remaining: offer.remaining - 1 } } };
     });
   }
+  function withdrawAllSellUnits(radId) {
+    setAnnualAuction((prev) => {
+      if (prev.phase !== 'auction') return prev;
+      const offer = prev.sellOffers[radId];
+      if (!offer || offer.remaining <= 0) return prev;
+      return { ...prev, sellOffers: { ...prev.sellOffers, [radId]: { ...offer, remaining: 0 } } };
+    });
+  }
   function submitBuyRequest(buyerId, qty) {
     if (qty < 1) return;
     setAnnualAuction((prev) => {
@@ -521,7 +529,7 @@ export default function App() {
               sellQtyDraft={sellQtyDraft} setSellQtyDraft={setSellQtyDraft}
               buyQtyDraft={buyQtyDraft} setBuyQtyDraft={setBuyQtyDraft}
               setSellCommitment={setSellCommitment} startAnnualAuction={startAnnualAuction}
-              withdrawSellUnit={withdrawSellUnit} submitBuyRequest={submitBuyRequest}
+              withdrawSellUnit={withdrawSellUnit} withdrawAllSellUnits={withdrawAllSellUnits} submitBuyRequest={submitBuyRequest}
               cancelBuyRequest={cancelBuyRequest} closeCurrentRound={closeCurrentRound}
               startNextYearAuction={startNextYearAuction}
             />
@@ -1044,7 +1052,7 @@ function CoverageTab({ mapDays, coverageAvailable }) {
 // ================= Annual Weekend-Call Auction Tab =================
 function AnnualAuctionTab({
   currentUser, radById, nowTick, annualAuction, sellQtyDraft, setSellQtyDraft, buyQtyDraft, setBuyQtyDraft,
-  setSellCommitment, startAnnualAuction, withdrawSellUnit, submitBuyRequest, cancelBuyRequest, closeCurrentRound, startNextYearAuction,
+  setSellCommitment, startAnnualAuction, withdrawSellUnit, withdrawAllSellUnits, submitBuyRequest, cancelBuyRequest, closeCurrentRound, startNextYearAuction,
 }) {
   const isPartner = PARTNER_TITLES.includes(currentUser.title);
 
@@ -1066,7 +1074,7 @@ function AnnualAuctionTab({
     <LiveAuctionPhase
       currentUser={currentUser} nowTick={nowTick} annualAuction={annualAuction}
       buyQtyDraft={buyQtyDraft} setBuyQtyDraft={setBuyQtyDraft}
-      withdrawSellUnit={withdrawSellUnit} submitBuyRequest={submitBuyRequest}
+      withdrawSellUnit={withdrawSellUnit} withdrawAllSellUnits={withdrawAllSellUnits} submitBuyRequest={submitBuyRequest}
       cancelBuyRequest={cancelBuyRequest} closeCurrentRound={closeCurrentRound}
     />
   );
@@ -1124,7 +1132,7 @@ function EnrollmentPhase({ currentUser, annualAuction, sellQtyDraft, setSellQtyD
   );
 }
 
-function LiveAuctionPhase({ currentUser, nowTick, annualAuction, buyQtyDraft, setBuyQtyDraft, withdrawSellUnit, submitBuyRequest, cancelBuyRequest, closeCurrentRound }) {
+function LiveAuctionPhase({ currentUser, nowTick, annualAuction, buyQtyDraft, setBuyQtyDraft, withdrawSellUnit, withdrawAllSellUnits, submitBuyRequest, cancelBuyRequest, closeCurrentRound }) {
   const round = annualAuction.rounds[annualAuction.rounds.length - 1];
   const closedRounds = annualAuction.rounds.slice(0, -1);
   const myOffer = annualAuction.sellOffers[currentUser.id] || { committed: 0, remaining: 0 };
@@ -1157,10 +1165,15 @@ function LiveAuctionPhase({ currentUser, nowTick, annualAuction, buyQtyDraft, se
       {myOffer.remaining > 0 && (
         <div className="bg-white border border-[#e6e7e8] rounded-xl p-4">
           <div className="text-sm font-medium text-[#211c35] mb-1">You're offering {myOffer.remaining} weekend{myOffer.remaining === 1 ? '' : 's'} for sale</div>
-          <p className="text-xs text-[#222222]/60 mb-3">You can withdraw one at a time if you've changed your mind about selling at the current price.</p>
-          <button onClick={() => withdrawSellUnit(currentUser.id)} className="flex items-center gap-1.5 text-xs border border-[#e6e7e8] rounded-md px-3 py-1.5 hover:bg-[#f8f8f8]">
-            <Ban size={12} /> Withdraw one weekend from sale
-          </button>
+          <p className="text-xs text-[#222222]/60 mb-3">Withdraw one at a time, or pull everything you haven't sold yet at once.</p>
+          <div className="flex gap-2">
+            <button onClick={() => withdrawSellUnit(currentUser.id)} className="flex items-center gap-1.5 text-xs border border-[#e6e7e8] rounded-md px-3 py-1.5 hover:bg-[#f8f8f8]">
+              <Ban size={12} /> Withdraw one weekend
+            </button>
+            <button onClick={() => withdrawAllSellUnits(currentUser.id)} className="flex items-center gap-1.5 text-xs border border-[#e6e7e8] rounded-md px-3 py-1.5 hover:bg-[#f8f8f8] text-[#966eed]">
+              <Ban size={12} /> Withdraw all {myOffer.remaining}
+            </button>
+          </div>
         </div>
       )}
 
