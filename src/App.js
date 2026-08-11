@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Calendar, Users, AlertTriangle, CheckCircle2, MapPin, Wifi, Plus, X, ArrowRightLeft, ShieldCheck, ChevronRight, Scale, DollarSign, Gavel, History, TrendingUp, Ban, Tag } from 'lucide-react';
+import { Calendar, Users, AlertTriangle, CheckCircle2, MapPin, Wifi, Plus, X, ArrowRightLeft, ShieldCheck, ChevronRight, Scale, DollarSign, Gavel, History, TrendingUp, Ban, Tag, Repeat, EyeOff, Timer } from 'lucide-react';
 
 // ---------- Static config ----------
 // NOTE: Cardiac and PET were added because they show up as subspecialties in the
@@ -21,11 +21,13 @@ function name(first, last, title) {
 // providers who work off-site and therefore can't cover shifts flagged "on-site required".
 const RADIOLOGISTS = [
   { id: 'gabboud', name: name('Ghadi', 'Abboud', 'MD'), title: 'MD', specialties: ['Body', 'General'], remote: false },
+  { id: 'cburch', name: name('Cassandra', 'Burch', 'PA'), title: 'PA', specialties: ['IR'], remote: false },
   { id: 'scarbajal', name: name('Scott', 'Carbajal', 'MD'), title: 'MD', specialties: ['General'], remote: true },
   { id: 'jchoi', name: name('James', 'Choi', 'MD'), title: 'MD', specialties: ['MSK', 'General'], remote: false },
   { id: 'aessenmacher', name: name('Alex', 'Essenmacher', 'MD'), title: 'MD', specialties: ['General'], remote: false },
   { id: 'mfazio', name: name('Michael', 'Fazio', 'DO'), title: 'DO', specialties: ['MSK', 'Neuro', 'Breast'], remote: false },
-  { id: 'wheggen', name: name('William', 'Heggen', 'MD'), title: 'MD', specialties: ['General', 'Breast'], remote: false },
+  { id: 'agieseke', name: name('Ashley', 'Gieseke', 'PA'), title: 'PA', specialties: ['IR'], remote: false },
+  { id: 'wheggen', name: name('William', 'Heggen', '-'), title: '-', specialties: ['General', 'Breast'], remote: false },
   { id: 'zhill', name: name('Zachary', 'Hill', 'DO'), title: 'DO', specialties: ['General'], remote: true },
   { id: 'nhilpipre', name: name('Nicholas', 'Hilpipre', 'DO'), title: 'DO', specialties: ['Breast', 'General', 'Peds', 'PET'], remote: false },
   { id: 'rholdsworth', name: name('Ryan', 'Holdsworth', 'MD'), title: 'MD', specialties: ['Neuro', 'General', 'PET'], remote: false },
@@ -41,6 +43,7 @@ const RADIOLOGISTS = [
   { id: 'eluebbert', name: name('Eric', 'Luebbert', 'DO'), title: 'DO', specialties: ['General'], remote: true },
   { id: 'dmagill', name: name('David', 'Magill', 'MD'), title: 'MD', specialties: ['IR', 'General'], remote: false },
   { id: 'rmenzel', name: name('Richard', 'Menzel', 'DO'), title: 'DO', specialties: ['General'], remote: true },
+  { id: 'rmiller', name: name('Rebecca', 'Miller', 'PA'), title: 'PA', specialties: ['IR'], remote: false },
   { id: 'gmyneni', name: name('Gopika', 'Myneni', 'MD'), title: 'MD', specialties: ['Breast'], remote: false },
   { id: 'apeters', name: name('Austin', 'Peters', 'DO'), title: 'DO', specialties: ['General', 'Breast', 'Cardiac'], remote: false },
   { id: 'jrappleye', name: name('Jeffrey', 'Rappleye', 'MD'), title: 'MD', specialties: ['Neuro', 'General', 'PET'], remote: false },
@@ -56,6 +59,11 @@ const RADIOLOGISTS = [
   { id: 'swise', name: name('Scott', 'Wise', 'MD'), title: 'MD', specialties: ['General'], remote: true },
   { id: 'bwynia', name: name('Brian', 'Wynia', 'DO'), title: 'DO', specialties: ['Breast', 'General'], remote: false },
 ];
+
+// The annual weekend-call auction is a partner-only obligation. Adjust PARTNER_TITLES
+// if PAs or other roles should also carry (or be able to sell/buy into) weekend call.
+const PARTNER_TITLES = ['MD', 'DO'];
+const PARTNERS = RADIOLOGISTS.filter((r) => PARTNER_TITLES.includes(r.title));
 
 // ---------- Date helpers (UTC day-number based, avoids TZ drift) ----------
 const toDay = (d) => Math.floor(new Date(d + 'T00:00:00Z').getTime() / 86400000);
@@ -119,6 +127,77 @@ const seedTrades = () => [
   { id: 't2', reqAId: 'v-bking-1', reqBId: 'v-nhilpipre-1', proposedBy: 'bking', status: 'pending', note: 'Swap my Aug 20\u201321 for your Sept 10\u201312' },
 ];
 
+// ---------- Annual weekend-call auction ----------
+// Rules encoded here: partners must work REQUIRED_WEEKENDS/year and can sell down to
+// MIN_WEEKENDS. Selling and buying is anonymous while a round is open — only the final
+// report reveals who sold to whom. Rounds start at ANNUAL_START_PRICE and step up by
+// ANNUAL_STEP each time a round doesn't clear the full pool. Real rounds run 7 days on
+// Central time; this prototype shows the true close time but also exposes a manual
+// "Close Round" action (labeled as an admin/testing action) since there's no server-side
+// scheduler here to auto-close a round after 7 real days.
+const REQUIRED_WEEKENDS = 8;
+const MIN_WEEKENDS = 4;
+const MAX_SELLABLE = REQUIRED_WEEKENDS - MIN_WEEKENDS;
+const ANNUAL_START_PRICE = 15000;
+const ANNUAL_STEP = 5000;
+const ROUND_LENGTH_MS = 1000 * 60 * 60 * 24 * 7;
+
+function initialAnnualAuction(year) {
+  const sellOffers = {};
+  PARTNERS.forEach((p) => { sellOffers[p.id] = { committed: 0, remaining: 0 }; });
+  return { year, phase: 'enrollment', sellOffers, rounds: [] };
+}
+
+// Round-robin, one unit at a time, across sellers who still have inventory — this is what
+// produces the "everyone who's selling gives up one before anyone gives up a second"
+// fairness rule from the spec. startOffset rotates which seller goes first each round so
+// the same partner doesn't always lose the first unit.
+// Buyer side is filled first-come-first-served by request timestamp; a request that can't
+// be fully filled from remaining pool gets a partial allocation and any leftover request
+// qty is simply dropped (the buyer would need to resubmit next round).
+function clearAnnualRound(sellOffers, buyRequests, startOffset) {
+  const sellerIds = Object.keys(sellOffers).filter((id) => sellOffers[id].remaining > 0);
+  const totalSupply = sellerIds.reduce((sum, id) => sum + sellOffers[id].remaining, 0);
+  const totalDemand = buyRequests.reduce((sum, r) => sum + r.qty, 0);
+  const unitsToAllocate = Math.min(totalSupply, totalDemand);
+
+  const cap = {};
+  sellerIds.forEach((id) => { cap[id] = sellOffers[id].remaining; });
+  const sellerSeq = [];
+  let idx = sellerIds.length ? startOffset % sellerIds.length : 0;
+  let guard = 0;
+  while (sellerSeq.length < unitsToAllocate && guard < unitsToAllocate * sellerIds.length + 10) {
+    const id = sellerIds[idx % sellerIds.length];
+    if (cap[id] > 0) { sellerSeq.push(id); cap[id]--; }
+    idx++;
+    guard++;
+  }
+
+  const sortedRequests = [...buyRequests].sort((a, b) => a.ts - b.ts);
+  const buyerSeq = [];
+  sortedRequests.forEach((r) => {
+    for (let i = 0; i < r.qty && buyerSeq.length < unitsToAllocate; i++) buyerSeq.push(r.buyerId);
+  });
+
+  const allocations = sellerSeq.map((sellerId, i) => ({ sellerId, buyerId: buyerSeq[i], qty: 1 }));
+
+  const updatedSellOffers = { ...sellOffers };
+  Object.keys(updatedSellOffers).forEach((id) => { updatedSellOffers[id] = { ...updatedSellOffers[id] }; });
+  allocations.forEach((a) => { updatedSellOffers[a.sellerId].remaining -= 1; });
+
+  return { allocations, updatedSellOffers, totalSupply, totalDemand, unitsAllocated: unitsToAllocate };
+}
+
+const fmtDateTimeCST = (ts) => new Date(ts).toLocaleString('en-US', {
+  timeZone: 'America/Chicago', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short',
+});
+const fmtCountdownDays = (ms) => {
+  if (ms <= 0) return 'Closing soon';
+  const totalHours = Math.floor(ms / 3600000);
+  const d = Math.floor(totalHours / 24), h = totalHours % 24;
+  return d > 0 ? `${d}d ${h}h remaining` : `${h}h remaining`;
+};
+
 const badgeColor = 'bg-[#e6e7e8] text-[#211c35]';
 
 export default function App() {
@@ -133,6 +212,11 @@ export default function App() {
   const [tradeReview, setTradeReview] = useState({});
   const [proposalTarget, setProposalTarget] = useState(null); // id of board listing being proposed against
   const [proposalMyReq, setProposalMyReq] = useState('');
+  const [annualAuction, setAnnualAuction] = useState(() => initialAnnualAuction(new Date().getFullYear() + 1));
+  const [sellQtyDraft, setSellQtyDraft] = useState(0);
+  const [buyQtyDraft, setBuyQtyDraft] = useState(1);
+  const [nowTick, setNowTick] = useState(Date.now());
+  useEffect(() => { const t = setInterval(() => setNowTick(Date.now()), 30000); return () => clearInterval(t); }, []);
 
   const currentUser = RADIOLOGISTS.find((r) => r.id === currentUserId);
   const radById = (id) => RADIOLOGISTS.find((r) => r.id === id);
@@ -279,7 +363,85 @@ export default function App() {
     setPostForm({ label: 'Overnight Call', date: '', startPrice: START_PRICE, specialty: currentUser.specialties[0], requiresOnSite: true });
   }
 
+  // ---------- Annual weekend-call auction ----------
+  function setSellCommitment(radId, qty) {
+    const clamped = Math.max(0, Math.min(MAX_SELLABLE, qty));
+    setAnnualAuction((prev) => {
+      if (prev.phase !== 'enrollment') return prev;
+      return {
+        ...prev,
+        sellOffers: { ...prev.sellOffers, [radId]: { committed: clamped, remaining: clamped } },
+      };
+    });
+  }
+  function startAnnualAuction() {
+    setAnnualAuction((prev) => {
+      if (prev.phase !== 'enrollment') return prev;
+      const totalSupply = Object.values(prev.sellOffers).reduce((sum, o) => sum + o.remaining, 0);
+      if (totalSupply === 0) return prev;
+      const now = Date.now();
+      return {
+        ...prev,
+        phase: 'auction',
+        rounds: [{ number: 1, price: ANNUAL_START_PRICE, opensAt: now, closesAt: now + ROUND_LENGTH_MS, status: 'open', buyRequests: [], allocations: null }],
+      };
+    });
+  }
+  function withdrawSellUnit(radId) {
+    setAnnualAuction((prev) => {
+      if (prev.phase !== 'auction') return prev;
+      const offer = prev.sellOffers[radId];
+      if (!offer || offer.remaining <= 0) return prev;
+      return { ...prev, sellOffers: { ...prev.sellOffers, [radId]: { ...offer, remaining: offer.remaining - 1 } } };
+    });
+  }
+  function submitBuyRequest(buyerId, qty) {
+    if (qty < 1) return;
+    setAnnualAuction((prev) => {
+      const rounds = [...prev.rounds];
+      const i = rounds.length - 1;
+      if (i < 0 || rounds[i].status !== 'open') return prev;
+      const others = rounds[i].buyRequests.filter((r) => r.buyerId !== buyerId);
+      rounds[i] = { ...rounds[i], buyRequests: [...others, { id: 'br-' + buyerId + '-' + Date.now(), buyerId, qty, ts: Date.now() }] };
+      return { ...prev, rounds };
+    });
+  }
+  function cancelBuyRequest(buyerId) {
+    setAnnualAuction((prev) => {
+      const rounds = [...prev.rounds];
+      const i = rounds.length - 1;
+      if (i < 0 || rounds[i].status !== 'open') return prev;
+      rounds[i] = { ...rounds[i], buyRequests: rounds[i].buyRequests.filter((r) => r.buyerId !== buyerId) };
+      return { ...prev, rounds };
+    });
+  }
+  function closeCurrentRound() {
+    setAnnualAuction((prev) => {
+      const rounds = [...prev.rounds];
+      const i = rounds.length - 1;
+      if (i < 0 || rounds[i].status !== 'open') return prev;
+      const { allocations, updatedSellOffers, unitsAllocated } = clearAnnualRound(prev.sellOffers, rounds[i].buyRequests, i);
+      rounds[i] = { ...rounds[i], status: 'closed', allocations };
+      const remainingSupply = Object.values(updatedSellOffers).reduce((sum, o) => sum + o.remaining, 0);
+      let phase = prev.phase;
+      if (remainingSupply > 0) {
+        const now = Date.now();
+        rounds.push({
+          number: rounds[i].number + 1, price: rounds[i].price + ANNUAL_STEP,
+          opensAt: now, closesAt: now + ROUND_LENGTH_MS, status: 'open', buyRequests: [], allocations: null,
+        });
+      } else {
+        phase = 'closed';
+      }
+      return { ...prev, phase, sellOffers: updatedSellOffers, rounds };
+    });
+  }
+  function startNextYearAuction() {
+    setAnnualAuction((prev) => initialAnnualAuction(prev.year + 1));
+  }
+
   const openAuctions = auctions.filter((a) => a.status === 'open').sort((x, y) => x.currentPrice - y.currentPrice);
+
   const settledAuctions = auctions.filter((a) => a.status !== 'open');
 
   const mapDays = dateRange('2026-08-05', '2026-08-25');
@@ -297,6 +459,7 @@ export default function App() {
         <nav className="flex-1 px-3 py-4 space-y-1">
           <NavItem icon={Gavel} label="Shift Marketplace" active={tab === 'auction'} onClick={() => setTab('auction')} />
           <NavItem icon={ArrowRightLeft} label="Vacation & Trades" active={tab === 'vacation'} onClick={() => setTab('vacation')} />
+          <NavItem icon={Repeat} label="Annual Call Auction" active={tab === 'annual'} onClick={() => setTab('annual')} />
           <NavItem icon={ShieldCheck} label="Coverage Map" active={tab === 'coverage'} onClick={() => setTab('coverage')} />
         </nav>
         <div className="px-4 py-4 border-t border-white/10 text-xs text-[#e6e7e8]/70">
@@ -309,6 +472,7 @@ export default function App() {
           <div className="font-semibold text-[#211c35] text-base">
             {tab === 'auction' && 'Weekend Shift Marketplace'}
             {tab === 'vacation' && 'Vacation Requests & Trades'}
+            {tab === 'annual' && `${annualAuction.year} Weekend Call Auction`}
             {tab === 'coverage' && 'Specialty Coverage Map'}
           </div>
           <div className="flex items-center gap-2 text-sm">
@@ -353,6 +517,18 @@ export default function App() {
           )}
           {tab === 'coverage' && (
             <CoverageTab mapDays={mapDays} coverageAvailable={coverageAvailable} />
+          )}
+          {tab === 'annual' && (
+            <AnnualAuctionTab
+              currentUser={currentUser} radById={radById} nowTick={nowTick}
+              annualAuction={annualAuction}
+              sellQtyDraft={sellQtyDraft} setSellQtyDraft={setSellQtyDraft}
+              buyQtyDraft={buyQtyDraft} setBuyQtyDraft={setBuyQtyDraft}
+              setSellCommitment={setSellCommitment} startAnnualAuction={startAnnualAuction}
+              withdrawSellUnit={withdrawSellUnit} submitBuyRequest={submitBuyRequest}
+              cancelBuyRequest={cancelBuyRequest} closeCurrentRound={closeCurrentRound}
+              startNextYearAuction={startNextYearAuction}
+            />
           )}
         </div>
       </div>
@@ -865,6 +1041,235 @@ function CoverageTab({ mapDays, coverageAvailable }) {
           </div>
         ))}
       </div>
+    </div>
+  );
+}
+
+// ================= Annual Weekend-Call Auction Tab =================
+function AnnualAuctionTab({
+  currentUser, radById, nowTick, annualAuction, sellQtyDraft, setSellQtyDraft, buyQtyDraft, setBuyQtyDraft,
+  setSellCommitment, startAnnualAuction, withdrawSellUnit, submitBuyRequest, cancelBuyRequest, closeCurrentRound, startNextYearAuction,
+}) {
+  const isPartner = PARTNER_TITLES.includes(currentUser.title);
+
+  if (!isPartner) {
+    return (
+      <div className="max-w-2xl bg-white border border-[#e6e7e8] rounded-xl p-5 text-sm text-[#222222]/70">
+        The annual weekend-call auction applies to partner radiologists (MD/DO). {currentUser.name} isn't enrolled in weekend call under the current roster settings.
+      </div>
+    );
+  }
+
+  if (annualAuction.phase === 'enrollment') {
+    return <EnrollmentPhase currentUser={currentUser} annualAuction={annualAuction} sellQtyDraft={sellQtyDraft} setSellQtyDraft={setSellQtyDraft} setSellCommitment={setSellCommitment} startAnnualAuction={startAnnualAuction} />;
+  }
+  if (annualAuction.phase === 'closed') {
+    return <ResultsReport radById={radById} annualAuction={annualAuction} startNextYearAuction={startNextYearAuction} />;
+  }
+  return (
+    <LiveAuctionPhase
+      currentUser={currentUser} nowTick={nowTick} annualAuction={annualAuction}
+      buyQtyDraft={buyQtyDraft} setBuyQtyDraft={setBuyQtyDraft}
+      withdrawSellUnit={withdrawSellUnit} submitBuyRequest={submitBuyRequest}
+      cancelBuyRequest={cancelBuyRequest} closeCurrentRound={closeCurrentRound}
+    />
+  );
+}
+
+function EnrollmentPhase({ currentUser, annualAuction, sellQtyDraft, setSellQtyDraft, setSellCommitment, startAnnualAuction }) {
+  const myOffer = annualAuction.sellOffers[currentUser.id] || { committed: 0, remaining: 0 };
+  const partnersCommitted = Object.values(annualAuction.sellOffers).filter((o) => o.committed > 0).length;
+  const totalCommitted = Object.values(annualAuction.sellOffers).reduce((sum, o) => sum + o.committed, 0);
+
+  return (
+    <div className="max-w-2xl space-y-6">
+      <div className="bg-white border border-[#e6e7e8] rounded-xl p-4">
+        <div className="flex items-center gap-2 mb-1">
+          <Repeat size={15} className="text-[#4a449c]" />
+          <h3 className="text-sm font-semibold text-[#211c35]">{annualAuction.year} weekend call &mdash; enrollment</h3>
+        </div>
+        <p className="text-xs text-[#222222]/60 mb-4">
+          Every partner covers {REQUIRED_WEEKENDS} call weekends this year, with a minimum of {MIN_WEEKENDS}. You can offer up to {MAX_SELLABLE} of yours for auction &mdash; the auction is anonymous, so no one sees who's selling how many until it closes.
+        </p>
+        <div className="flex items-center gap-3">
+          <label className="text-xs font-medium text-[#222222]/60">Weekends to offer for sale</label>
+          <input
+            type="number" min={0} max={MAX_SELLABLE}
+            value={sellQtyDraft}
+            onChange={(e) => setSellQtyDraft(Math.max(0, Math.min(MAX_SELLABLE, Number(e.target.value))))}
+            className="w-20 border border-[#e6e7e8] rounded-md px-2 py-1.5 text-sm"
+          />
+          <button
+            onClick={() => setSellCommitment(currentUser.id, sellQtyDraft)}
+            className="bg-[#635cc6] hover:bg-[#4a449c] text-white text-sm font-medium px-3 py-1.5 rounded-md"
+          >
+            Save my offer
+          </button>
+          {myOffer.committed > 0 && (
+            <span className="text-xs text-[#4a449c] flex items-center gap-1"><CheckCircle2 size={13} /> Currently offering {myOffer.committed}</span>
+          )}
+        </div>
+      </div>
+
+      <div className="bg-white border border-[#e6e7e8] rounded-xl p-4 flex items-center justify-between">
+        <div className="text-sm">
+          <div className="font-medium text-[#211c35] flex items-center gap-1.5"><EyeOff size={13} /> {partnersCommitted} partner{partnersCommitted === 1 ? '' : 's'} have offered weekends so far</div>
+          <div className="text-xs text-[#222222]/60 mt-0.5">{totalCommitted} weekend{totalCommitted === 1 ? '' : 's'} in the pool, anonymously. Identities stay hidden until the auction closes.</div>
+        </div>
+        <button
+          onClick={startAnnualAuction}
+          disabled={totalCommitted === 0}
+          className="bg-[#211c35] disabled:opacity-40 text-white text-sm font-medium px-4 py-2 rounded-md shrink-0"
+        >
+          Start Auction (Round 1)
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function LiveAuctionPhase({ currentUser, nowTick, annualAuction, buyQtyDraft, setBuyQtyDraft, withdrawSellUnit, submitBuyRequest, cancelBuyRequest, closeCurrentRound }) {
+  const round = annualAuction.rounds[annualAuction.rounds.length - 1];
+  const closedRounds = annualAuction.rounds.slice(0, -1);
+  const myOffer = annualAuction.sellOffers[currentUser.id] || { committed: 0, remaining: 0 };
+  const poolRemaining = Object.values(annualAuction.sellOffers).reduce((sum, o) => sum + o.remaining, 0);
+  const myRequest = round.buyRequests.find((r) => r.buyerId === currentUser.id);
+  const remaining = round.closesAt - nowTick;
+
+  return (
+    <div className="max-w-2xl space-y-6">
+      <div className="bg-white border border-[#e6e7e8] rounded-xl p-4">
+        <div className="flex items-start justify-between mb-3">
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="font-semibold text-[#211c35]">Round {round.number}</span>
+              <span className="text-xs font-semibold px-2 py-0.5 rounded bg-[#635cc6]/10 text-[#4a449c] flex items-center gap-1"><EyeOff size={11} /> Anonymous</span>
+            </div>
+            <div className="text-xs text-[#222222]/60 mt-1 flex items-center gap-1"><Timer size={12} /> Closes {fmtDateTimeCST(round.closesAt)} &middot; {fmtCountdownDays(remaining)}</div>
+          </div>
+          <div className="text-right">
+            <div className="text-xs text-[#222222]/60">Price per weekend</div>
+            <div className="text-lg font-semibold text-[#4a449c]">{fmtMoney(round.price)}</div>
+          </div>
+        </div>
+        <div className="flex items-center gap-2 text-sm bg-[#f8f8f8] rounded-md px-3 py-2">
+          <Users size={14} className="text-[#222222]/50" />
+          <span>{poolRemaining} weekend{poolRemaining === 1 ? '' : 's'} still available this round, from an undisclosed number of partners.</span>
+        </div>
+      </div>
+
+      {myOffer.remaining > 0 && (
+        <div className="bg-white border border-[#e6e7e8] rounded-xl p-4">
+          <div className="text-sm font-medium text-[#211c35] mb-1">You're offering {myOffer.remaining} weekend{myOffer.remaining === 1 ? '' : 's'} for sale</div>
+          <p className="text-xs text-[#222222]/60 mb-3">You can withdraw one at a time if you've changed your mind about selling at the current price.</p>
+          <button onClick={() => withdrawSellUnit(currentUser.id)} className="flex items-center gap-1.5 text-xs border border-[#e6e7e8] rounded-md px-3 py-1.5 hover:bg-[#f8f8f8]">
+            <Ban size={12} /> Withdraw one weekend from sale
+          </button>
+        </div>
+      )}
+
+      <div className="bg-white border border-[#e6e7e8] rounded-xl p-4">
+        <div className="text-sm font-medium text-[#211c35] mb-1">Take on extra weekends</div>
+        <p className="text-xs text-[#222222]/60 mb-3">Request how many you'd take at {fmtMoney(round.price)} each. You can change or cancel this until the round closes.</p>
+        {myRequest ? (
+          <div className="flex items-center gap-3 text-sm">
+            <span className="flex items-center gap-2 text-[#4a449c] font-medium">
+              <CheckCircle2 size={15} /> Requesting {myRequest.qty} at {fmtMoney(round.price * myRequest.qty)} total
+            </span>
+            <button onClick={() => cancelBuyRequest(currentUser.id)} className="text-xs text-[#222222]/60 border border-[#e6e7e8] rounded-md px-2 py-1 hover:bg-[#f8f8f8]">Cancel request</button>
+          </div>
+        ) : (
+          <div className="flex items-center gap-2">
+            <input
+              type="number" min={1}
+              value={buyQtyDraft}
+              onChange={(e) => setBuyQtyDraft(Math.max(1, Number(e.target.value)))}
+              className="w-20 border border-[#e6e7e8] rounded-md px-2 py-1.5 text-sm"
+            />
+            <button
+              onClick={() => submitBuyRequest(currentUser.id, buyQtyDraft)}
+              className="bg-[#635cc6] hover:bg-[#4a449c] text-white text-sm font-medium px-3 py-1.5 rounded-md"
+            >
+              Request weekends
+            </button>
+          </div>
+        )}
+      </div>
+
+      <div className="bg-white border border-dashed border-[#966eed]/50 rounded-xl p-4">
+        <div className="text-xs text-[#222222]/60 mb-2">Rounds close automatically after 7 days in production. This is a prototype without a server-side scheduler, so closing the round is a manual admin action here.</div>
+        <button onClick={closeCurrentRound} className="flex items-center gap-1.5 text-xs bg-[#211c35] text-white rounded-md px-3 py-1.5">
+          <Scale size={12} /> Close Round {round.number} Now (admin)
+        </button>
+      </div>
+
+      {closedRounds.length > 0 && (
+        <div>
+          <div className="text-sm font-semibold text-[#211c35] mb-2 flex items-center gap-1.5"><History size={14} /> Earlier rounds</div>
+          <div className="space-y-2">
+            {closedRounds.map((r) => (
+              <div key={r.number} className="bg-white border border-[#e6e7e8] rounded-lg px-4 py-2.5 text-sm flex items-center justify-between">
+                <span>Round {r.number} &middot; {fmtMoney(r.price)}/weekend</span>
+                <span className="text-[#222222]/60">{r.allocations.length} weekend{r.allocations.length === 1 ? '' : 's'} sold</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ResultsReport({ radById, annualAuction, startNextYearAuction }) {
+  const allAllocations = annualAuction.rounds.flatMap((r) => r.allocations.map((a) => ({ ...a, round: r.number, price: r.price })));
+
+  const bySeller = {};
+  allAllocations.forEach((a) => {
+    if (!bySeller[a.sellerId]) bySeller[a.sellerId] = [];
+    bySeller[a.sellerId].push(a);
+  });
+
+  const totalSold = allAllocations.length;
+  const totalValue = allAllocations.reduce((sum, a) => sum + a.price, 0);
+
+  return (
+    <div className="max-w-2xl space-y-6">
+      <div className="bg-white border border-[#e6e7e8] rounded-xl p-4">
+        <div className="flex items-center gap-2 mb-1">
+          <CheckCircle2 size={16} className="text-[#4a449c]" />
+          <h3 className="text-sm font-semibold text-[#211c35]">{annualAuction.year} weekend call auction &mdash; final results</h3>
+        </div>
+        <p className="text-xs text-[#222222]/60">
+          {totalSold} weekend{totalSold === 1 ? '' : 's'} changed hands across {annualAuction.rounds.length} round{annualAuction.rounds.length === 1 ? '' : 's'}, totaling {fmtMoney(totalValue)}. Identities are now public.
+        </p>
+      </div>
+
+      <div className="space-y-2">
+        {Object.entries(bySeller).map(([sellerId, sales]) => {
+          const seller = radById(sellerId);
+          const total = sales.reduce((sum, s) => sum + s.price, 0);
+          return (
+            <div key={sellerId} className="bg-white border border-[#e6e7e8] rounded-xl p-4">
+              <div className="flex items-center justify-between mb-2">
+                <span className="font-medium text-[#211c35]">{seller.name}</span>
+                <span className="text-sm text-[#4a449c] font-semibold">{fmtMoney(total)}</span>
+              </div>
+              <div className="space-y-1">
+                {sales.map((s, i) => (
+                  <div key={i} className="text-xs text-[#222222]/70 flex items-center gap-1.5">
+                    <ChevronRight size={12} className="text-[#222222]/30" />
+                    Sold 1 weekend to {radById(s.buyerId).name} &middot; Round {s.round} &middot; {fmtMoney(s.price)}
+                  </div>
+                ))}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      <button onClick={startNextYearAuction} className="flex items-center gap-1.5 bg-[#635cc6] hover:bg-[#4a449c] text-white text-sm font-medium px-4 py-2 rounded-md">
+        <Repeat size={14} /> Start {annualAuction.year + 1} Enrollment
+      </button>
     </div>
   );
 }
