@@ -20,14 +20,11 @@ function name(first, last, title) {
 // array (primary first) since most providers cover more than one. "remote" marks
 // providers who work off-site and therefore can't cover shifts flagged "on-site required".
 const RADIOLOGISTS = [
-  { id: 'gabboud', name: name('Ghadi', 'Abboud', 'MD'), title: 'MD', specialties: ['Body', 'General'], remote: false },
-  { id: 'cburch', name: name('Cassandra', 'Burch', 'PA'), title: 'PA', specialties: ['IR'], remote: false },
   { id: 'scarbajal', name: name('Scott', 'Carbajal', 'MD'), title: 'MD', specialties: ['General'], remote: true },
   { id: 'jchoi', name: name('James', 'Choi', 'MD'), title: 'MD', specialties: ['MSK', 'General'], remote: false },
   { id: 'aessenmacher', name: name('Alex', 'Essenmacher', 'MD'), title: 'MD', specialties: ['General'], remote: false },
   { id: 'mfazio', name: name('Michael', 'Fazio', 'DO'), title: 'DO', specialties: ['MSK', 'Neuro', 'Breast'], remote: false },
-  { id: 'agieseke', name: name('Ashley', 'Gieseke', 'PA'), title: 'PA', specialties: ['IR'], remote: false },
-  { id: 'wheggen', name: name('William', 'Heggen', '-'), title: '-', specialties: ['General', 'Breast'], remote: false },
+  { id: 'wheggen', name: name('William', 'Heggen', 'MD'), title: 'MD', specialties: ['General', 'Breast'], remote: false },
   { id: 'zhill', name: name('Zachary', 'Hill', 'DO'), title: 'DO', specialties: ['General'], remote: true },
   { id: 'nhilpipre', name: name('Nicholas', 'Hilpipre', 'DO'), title: 'DO', specialties: ['Breast', 'General', 'Peds', 'PET'], remote: false },
   { id: 'rholdsworth', name: name('Ryan', 'Holdsworth', 'MD'), title: 'MD', specialties: ['Neuro', 'General', 'PET'], remote: false },
@@ -43,7 +40,6 @@ const RADIOLOGISTS = [
   { id: 'eluebbert', name: name('Eric', 'Luebbert', 'DO'), title: 'DO', specialties: ['General'], remote: true },
   { id: 'dmagill', name: name('David', 'Magill', 'MD'), title: 'MD', specialties: ['IR', 'General'], remote: false },
   { id: 'rmenzel', name: name('Richard', 'Menzel', 'DO'), title: 'DO', specialties: ['General'], remote: true },
-  { id: 'rmiller', name: name('Rebecca', 'Miller', 'PA'), title: 'PA', specialties: ['IR'], remote: false },
   { id: 'gmyneni', name: name('Gopika', 'Myneni', 'MD'), title: 'MD', specialties: ['Breast'], remote: false },
   { id: 'apeters', name: name('Austin', 'Peters', 'DO'), title: 'DO', specialties: ['General', 'Breast', 'Cardiac'], remote: false },
   { id: 'jrappleye', name: name('Jeffrey', 'Rappleye', 'MD'), title: 'MD', specialties: ['Neuro', 'General', 'PET'], remote: false },
