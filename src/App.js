@@ -247,6 +247,7 @@ const fmtCountdownDays = (ms) => {
 // NOTE: holiday dates are placeholders — swap in the practice's actual observed holiday weeks.
 const ANNUAL_VACATION_POINTS = 100;
 const REQUIRED_VACATION_WEEKS = 12;
+const PICK_TIME_LIMIT_MS = 1000 * 60 * 60 * 24 * 3; // 3 days to pick before auto-skip
 const HOLIDAY_WEEKS = [
   { id: 'newyears', label: "New Year's Week", start: '2027-01-01', end: '2027-01-03' },
   { id: 'memorial', label: 'Memorial Day Week', start: '2027-05-29', end: '2027-05-31' },
@@ -259,7 +260,7 @@ const HOLIDAY_WEEKS = [
 function initialVacationAuction(year) {
   return {
     year, phase: 'holiday-bidding', bids: [], results: null,
-    draftOrder: null, weeksWon: null, turnCursor: 0, standardPicks: [],
+    draftOrder: null, weeksWon: null, turnCursor: 0, standardPicks: [], turnStartedAt: null,
   };
 }
 
@@ -687,7 +688,7 @@ export default function App() {
         return leftoverB - leftoverA || a.localeCompare(b);
       });
       setVacationRequests(working);
-      return { ...prev, phase: 'standard-picks', results, weeksWon, draftOrder, turnCursor: 0, standardPicks: [] };
+      return { ...prev, phase: 'standard-picks', results, weeksWon, draftOrder, turnCursor: 0, standardPicks: [], turnStartedAt: Date.now() };
     });
   }
   // A standard-week pick is only accepted if it's actually that partner's turn and it doesn't
@@ -709,15 +710,37 @@ export default function App() {
       }]);
       const weeksWon = { ...prev.weeksWon, [radId]: (prev.weeksWon[radId] || 0) + 1 };
       const standardPicks = [...prev.standardPicks, { radId, start, end }];
-      const nextState = { ...prev, weeksWon, standardPicks, turnCursor: (turn.idx + 1) % prev.draftOrder.length };
+      const nextState = { ...prev, weeksWon, standardPicks, turnCursor: (turn.idx + 1) % prev.draftOrder.length, turnStartedAt: Date.now() };
       const nextTurn = getCurrentTurn(nextState);
       return nextTurn ? nextState : { ...nextState, phase: 'closed' };
     });
     return error;
   }
+  // Auto-skip: if whoever's on the clock hasn't picked within PICK_TIME_LIMIT_MS, move on
+  // without granting them a week. They keep their required count and simply come back around
+  // on the next lap of the rotation. skippedByAdmin lets the same logic be triggered manually
+  // for testing, since there's no server-side scheduler here to enforce the real 3-day window
+  // while the browser tab is closed.
+  function skipTurn() {
+    setVacationAuction((prev) => {
+      if (prev.phase !== 'standard-picks') return prev;
+      const turn = getCurrentTurn(prev);
+      if (!turn) return prev;
+      const nextState = { ...prev, turnCursor: (turn.idx + 1) % prev.draftOrder.length, turnStartedAt: Date.now() };
+      const nextTurn = getCurrentTurn(nextState);
+      return nextTurn ? nextState : { ...nextState, phase: 'closed' };
+    });
+  }
   function startNextYearVacationDraft() {
     setVacationAuction((prev) => initialVacationAuction(prev.year + 1));
   }
+  // Real enforcement of the 3-day pick window: fires whenever the ticking clock crosses the
+  // deadline for whoever's currently on the clock. This only fires while a browser tab has the
+  // app open — see the manual "Skip" button in the UI for testing without waiting 3 real days.
+  useEffect(() => {
+    if (vacationAuction.phase !== 'standard-picks' || !vacationAuction.turnStartedAt) return;
+    if (nowTick - vacationAuction.turnStartedAt > PICK_TIME_LIMIT_MS) skipTurn();
+  }, [nowTick, vacationAuction.phase, vacationAuction.turnStartedAt]);
 
   const openAuctions = auctions.filter((a) => a.status === 'open').sort((x, y) => x.currentPrice - y.currentPrice);
 
@@ -797,7 +820,7 @@ export default function App() {
             />
           )}
           {tab === 'coverage' && (
-            <CoverageTab mapDays={mapDays} coverageAvailable={coverageAvailable} />
+            <CoverageTab mapDays={mapDays} coverageAvailable={coverageAvailable} totalOffCount={totalOffCount} />
           )}
           {tab === 'annual' && (
             <AnnualAuctionTab
@@ -811,6 +834,7 @@ export default function App() {
               startNextYearAuction={startNextYearAuction}
               vacationAuction={vacationAuction} setVacationBid={setVacationBid}
               closeHolidayBidding={closeHolidayBidding} makeStandardPick={makeStandardPick} startNextYearVacationDraft={startNextYearVacationDraft}
+              skipTurn={skipTurn}
               checkRange={checkRange} vacationRequests={vacationRequests}
             />
           )}
@@ -997,7 +1021,7 @@ function AuctionCard({ auction, currentUser, radById, claimShift, raisePrice, wi
             <button onClick={() => raisePrice(auction)} className="flex items-center gap-1 text-xs text-[#4a449c] border border-[#e6e7e8] rounded-md px-2 py-1 hover:bg-[#f8f8f8]">
               <TrendingUp size={12} /> Raise by ${STEP.toLocaleString()}
             </button>
-            <button onClick={() => withdrawListing(auction)} className="flex items-center gap-1 text-xs text-[#222222]/60 border border-[#e6e7e8] rounded-md px-2 py-1 hover:bg-[#f8f8f8]">
+            <button onClick={() => { if (window.confirm(`Withdraw "${auction.label}" (${auction.date})? Anyone who was about to claim it will no longer be able to.`)) withdrawListing(auction); }} className="flex items-center gap-1 text-xs text-[#222222]/60 border border-[#e6e7e8] rounded-md px-2 py-1 hover:bg-[#f8f8f8]">
               <Ban size={12} /> Not worth it &mdash; withdraw
             </button>
           </div>
@@ -1047,6 +1071,17 @@ function VacationTab({
   pendingTradesForMe, pendingDayTradesForMe,
 }) {
   const myRequests = vacationRequests.filter((v) => v.radId === currentUser.id);
+  const [networkSearch, setNetworkSearch] = useState('');
+  const [networkMonth, setNetworkMonth] = useState('all');
+  const monthOptions = Array.from(new Set(
+    vacationRequests.flatMap((v) => v.days).map((d) => d.slice(0, 7))
+  )).sort();
+  const networkVacations = vacationRequests.filter((v) => {
+    if (v.radId === currentUser.id) return false;
+    if (networkSearch.trim() && !radById(v.radId).name.toLowerCase().includes(networkSearch.trim().toLowerCase())) return false;
+    if (networkMonth !== 'all' && !v.days.some((d) => d.startsWith(networkMonth))) return false;
+    return true;
+  });
   const boardListings = vacationRequests.filter((v) =>
     v.openToTrade && v.radId !== currentUser.id && v.status === 'approved' && !idsInPendingTrades.has(v.id)
   );
@@ -1115,9 +1150,30 @@ function VacationTab({
       </div>
 
       <div>
-        <h3 className="text-sm font-semibold text-[#211c35] mb-2">Network vacation calendar</h3>
+        <div className="flex items-center justify-between mb-2 gap-2">
+          <h3 className="text-sm font-semibold text-[#211c35]">Network vacation calendar</h3>
+          <div className="flex items-center gap-2">
+            <select
+              value={networkMonth} onChange={(e) => setNetworkMonth(e.target.value)}
+              className="border border-[#e6e7e8] rounded-md px-2 py-1 text-xs bg-white"
+            >
+              <option value="all">All months</option>
+              {monthOptions.map((ym) => {
+                const [y, m] = ym.split('-');
+                const label = new Date(Date.UTC(Number(y), Number(m) - 1, 1)).toLocaleString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' });
+                return <option key={ym} value={ym}>{label}</option>;
+              })}
+            </select>
+            <input
+              type="text" value={networkSearch} onChange={(e) => setNetworkSearch(e.target.value)}
+              placeholder="Search by name&hellip;"
+              className="border border-[#e6e7e8] rounded-md px-2 py-1 text-xs w-40"
+            />
+          </div>
+        </div>
         <div className="space-y-2">
-          {vacationRequests.filter((v) => v.radId !== currentUser.id).map((v) => (
+          {networkVacations.length === 0 && <div className="text-sm text-[#222222]/50">No matching weeks.</div>}
+          {networkVacations.map((v) => (
             <RequestRow key={v.id} v={v} radById={radById} overrideRequest={overrideRequest} withdrawRequest={withdrawRequest} readOnly />
           ))}
         </div>
@@ -1320,7 +1376,7 @@ function RequestRow({ v, radById, overrideRequest, withdrawRequest, readOnly, to
             </button>
           )}
           {!readOnly && (
-            <button onClick={() => withdrawRequest(v.id)} className="text-[#222222]/40 hover:text-[#966eed]"><X size={14} /></button>
+            <button onClick={() => { if (window.confirm(`Withdraw this vacation week entirely? This can't be undone.`)) withdrawRequest(v.id); }} className="text-[#222222]/40 hover:text-[#966eed]"><X size={14} /></button>
           )}
         </div>
       </div>
@@ -1406,7 +1462,7 @@ function TradeCard({ t, vacationRequests, radById, review, reviewTrade, finalize
                 <button onClick={() => finalizeTrade(t)} className="bg-[#635cc6] hover:bg-[#4a449c] text-white text-xs font-medium px-3 py-1.5 rounded-md">
                   {hasIssues ? 'Override & Confirm Swap' : 'Confirm Swap'}
                 </button>
-                <button onClick={() => declineTrade(t.id)} className="text-xs text-[#222222]/60 px-3 py-1.5">Decline</button>
+                <button onClick={() => { if (window.confirm('Decline this trade proposal?')) declineTrade(t.id); }} className="text-xs text-[#222222]/60 px-3 py-1.5">Decline</button>
               </div>
             </div>
           )}
@@ -1461,7 +1517,7 @@ function DayTradeCard({ t, vacationRequests, radById, checkDaySwap, finalizeDayT
             <button onClick={() => finalizeDayTrade(t)} className="bg-[#635cc6] hover:bg-[#4a449c] text-white text-xs font-medium px-3 py-1.5 rounded-md">
               {hasIssues ? 'Override & Confirm Swap' : 'Confirm Swap'}
             </button>
-            <button onClick={() => declineDayTrade(t.id)} className="text-xs text-[#222222]/60 px-3 py-1.5">Decline</button>
+            <button onClick={() => { if (window.confirm('Decline this day-swap offer?')) declineDayTrade(t.id); }} className="text-xs text-[#222222]/60 px-3 py-1.5">Decline</button>
           </div>
         </div>
       )}
@@ -1470,10 +1526,10 @@ function DayTradeCard({ t, vacationRequests, radById, checkDaySwap, finalizeDayT
 }
 
 // ================= Coverage Tab =================
-function CoverageTab({ mapDays, coverageAvailable }) {
+function CoverageTab({ mapDays, coverageAvailable, totalOffCount }) {
   return (
     <div>
-      <p className="text-sm text-[#222222]/70 mb-4">Each cell shows how many qualified radiologists remain available after approved vacations. Green = buffer above minimum, amber = exactly at minimum, red = below minimum.</p>
+      <p className="text-sm text-[#222222]/70 mb-4">Each cell shows how many qualified radiologists remain available after approved vacations. Green = buffer above minimum, amber = exactly at minimum, red = below minimum. The "Total Off" row is a separate, network-wide cap on how many people can be off on the same day at all, regardless of specialty.</p>
 
       <div className="overflow-x-auto bg-white border border-[#e6e7e8] rounded-xl p-4 mb-6">
         <table className="border-collapse text-xs">
@@ -1484,6 +1540,21 @@ function CoverageTab({ mapDays, coverageAvailable }) {
             </tr>
           </thead>
           <tbody>
+            <tr>
+              <td className="pr-3 py-1 sticky left-0 bg-white font-semibold text-[#211c35] whitespace-nowrap">Total Off ({MAX_SIMULTANEOUS_OFF} cap)</td>
+              {mapDays.map((d) => {
+                const off = totalOffCount(d, null, []);
+                const color = off > MAX_SIMULTANEOUS_OFF ? 'bg-[#966eed]' : off === MAX_SIMULTANEOUS_OFF ? 'bg-[#e6e7e8] text-[#211c35] border border-[#966eed]/50' : 'bg-[#635cc6]/15 text-[#211c35]';
+                return (
+                  <td key={d} className="p-0.5">
+                    <div className={`w-7 h-7 flex items-center justify-center rounded font-semibold ${color} ${off > MAX_SIMULTANEOUS_OFF ? 'text-white' : ''}`}>
+                      {off}
+                    </div>
+                  </td>
+                );
+              })}
+            </tr>
+            <tr><td colSpan={mapDays.length + 1} className="pt-2"></td></tr>
             {SPECIALTIES.map((sp) => (
               <tr key={sp}>
                 <td className="pr-3 py-1 sticky left-0 bg-white font-medium text-[#211c35] whitespace-nowrap">{sp}</td>
@@ -1528,7 +1599,7 @@ function CoverageTab({ mapDays, coverageAvailable }) {
 function AnnualAuctionTab({
   currentUser, radById, nowTick, annualAuction, sellQtyDraft, setSellQtyDraft, buyQtyDraft, setBuyQtyDraft,
   setSellCommitment, startAnnualAuction, withdrawSellUnit, withdrawAllSellUnits, submitBuyRequest, cancelBuyRequest, closeCurrentRound, startNextYearAuction,
-  vacationAuction, setVacationBid, closeHolidayBidding, makeStandardPick, startNextYearVacationDraft,
+  vacationAuction, setVacationBid, closeHolidayBidding, makeStandardPick, startNextYearVacationDraft, skipTurn,
   checkRange, vacationRequests,
 }) {
   const [subTab, setSubTab] = useState('call');
@@ -1574,9 +1645,9 @@ function AnnualAuctionTab({
         )
       ) : (
         <VacationDraftPanel
-          currentUser={currentUser} radById={radById} vacationAuction={vacationAuction}
+          currentUser={currentUser} radById={radById} vacationAuction={vacationAuction} nowTick={nowTick}
           setVacationBid={setVacationBid} closeHolidayBidding={closeHolidayBidding}
-          makeStandardPick={makeStandardPick} startNextYearVacationDraft={startNextYearVacationDraft}
+          makeStandardPick={makeStandardPick} startNextYearVacationDraft={startNextYearVacationDraft} skipTurn={skipTurn}
           checkRange={checkRange} vacationRequests={vacationRequests}
         />
       )}
@@ -1674,7 +1745,7 @@ function LiveAuctionPhase({ currentUser, nowTick, annualAuction, buyQtyDraft, se
             <button onClick={() => withdrawSellUnit(currentUser.id)} className="flex items-center gap-1.5 text-xs border border-[#e6e7e8] rounded-md px-3 py-1.5 hover:bg-[#f8f8f8]">
               <Ban size={12} /> Withdraw one weekend
             </button>
-            <button onClick={() => withdrawAllSellUnits(currentUser.id)} className="flex items-center gap-1.5 text-xs border border-[#e6e7e8] rounded-md px-3 py-1.5 hover:bg-[#f8f8f8] text-[#966eed]">
+            <button onClick={() => { if (window.confirm(`Withdraw all ${myOffer.remaining} weekends from sale?`)) withdrawAllSellUnits(currentUser.id); }} className="flex items-center gap-1.5 text-xs border border-[#e6e7e8] rounded-md px-3 py-1.5 hover:bg-[#f8f8f8] text-[#966eed]">
               <Ban size={12} /> Withdraw all {myOffer.remaining}
             </button>
           </div>
@@ -1711,7 +1782,7 @@ function LiveAuctionPhase({ currentUser, nowTick, annualAuction, buyQtyDraft, se
 
       <div className="bg-white border border-dashed border-[#966eed]/50 rounded-xl p-4">
         <div className="text-xs text-[#222222]/60 mb-2">Rounds close automatically after 7 days in production. This is a prototype without a server-side scheduler, so closing the round is a manual admin action here.</div>
-        <button onClick={closeCurrentRound} className="flex items-center gap-1.5 text-xs bg-[#211c35] text-white rounded-md px-3 py-1.5">
+        <button onClick={() => { if (window.confirm(`Close Round ${round.number} now? This locks in results and can't be undone.`)) closeCurrentRound(); }} className="flex items-center gap-1.5 text-xs bg-[#211c35] text-white rounded-md px-3 py-1.5">
           <Scale size={12} /> Close Round {round.number} Now (admin)
         </button>
       </div>
@@ -1787,14 +1858,15 @@ function ResultsReport({ radById, annualAuction, startNextYearAuction }) {
   );
 }
 
-function VacationDraftPanel({ currentUser, radById, vacationAuction, setVacationBid, closeHolidayBidding, makeStandardPick, startNextYearVacationDraft, checkRange, vacationRequests }) {
+function VacationDraftPanel({ currentUser, radById, vacationAuction, nowTick, setVacationBid, closeHolidayBidding, makeStandardPick, startNextYearVacationDraft, skipTurn, checkRange, vacationRequests }) {
   if (vacationAuction.phase === 'closed') {
     return <VacationDraftClosed radById={radById} vacationAuction={vacationAuction} startNextYearVacationDraft={startNextYearVacationDraft} />;
   }
   if (vacationAuction.phase === 'standard-picks') {
     return (
       <StandardPicksPhase
-        currentUser={currentUser} radById={radById} vacationAuction={vacationAuction} makeStandardPick={makeStandardPick}
+        currentUser={currentUser} radById={radById} vacationAuction={vacationAuction} nowTick={nowTick}
+        makeStandardPick={makeStandardPick} skipTurn={skipTurn}
         checkRange={checkRange} vacationRequests={vacationRequests}
       />
     );
@@ -1848,7 +1920,7 @@ function HolidayBiddingPhase({ currentUser, vacationAuction, setVacationBid, clo
 
       <div className="bg-white border border-dashed border-[#966eed]/50 rounded-xl p-4">
         <div className="text-xs text-[#222222]/60 mb-2">In production this closes automatically once the bidding window ends. This prototype has no scheduler, so running the draft is a manual admin action.</div>
-        <button onClick={closeHolidayBidding} className="flex items-center gap-1.5 text-xs bg-[#211c35] text-white rounded-md px-3 py-1.5">
+        <button onClick={() => { if (window.confirm('Close holiday bidding and start the standard-week draft? Bids lock in and this cannot be undone.')) closeHolidayBidding(); }} className="flex items-center gap-1.5 text-xs bg-[#211c35] text-white rounded-md px-3 py-1.5">
           <Scale size={12} /> Close Bidding & Start Stage 2 (admin)
         </button>
       </div>
@@ -1856,7 +1928,7 @@ function HolidayBiddingPhase({ currentUser, vacationAuction, setVacationBid, clo
   );
 }
 
-function StandardPicksPhase({ currentUser, radById, vacationAuction, makeStandardPick, checkRange, vacationRequests }) {
+function StandardPicksPhase({ currentUser, radById, vacationAuction, nowTick, makeStandardPick, skipTurn, checkRange, vacationRequests }) {
   const { draftOrder, weeksWon } = vacationAuction;
   const turn = getCurrentTurn(vacationAuction);
   const myWeeksWon = weeksWon[currentUser.id] || 0;
@@ -1869,7 +1941,8 @@ function StandardPicksPhase({ currentUser, radById, vacationAuction, makeStandar
     vacationRequests.filter((v) => v.radId === currentUser.id && v.status === 'approved').flatMap((v) => v.days)
   );
   const gridWeeks = isMyTurn ? monthGridWeeks(vacationAuction.year, calMonth) : [];
-  const monthLabel = new Date(Date.UTC(vacationAuction.year, calMonth, 1)).toLocaleString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' });
+  const pickDeadline = vacationAuction.turnStartedAt ? vacationAuction.turnStartedAt + PICK_TIME_LIMIT_MS : null;
+  const timeLeft = pickDeadline ? pickDeadline - nowTick : null;
 
   return (
     <div className="max-w-2xl space-y-6">
@@ -1879,7 +1952,7 @@ function StandardPicksPhase({ currentUser, radById, vacationAuction, makeStandar
           <h3 className="text-sm font-semibold text-[#211c35]">{vacationAuction.year} standard-week draft</h3>
         </div>
         <p className="text-xs text-[#222222]/60">
-          Stage 2 of 2. Draft order is set by leftover points from Stage 1. Each partner picks one week at a time, in order, until everyone reaches {REQUIRED_VACATION_WEEKS} weeks for the year. Every week runs Sunday&ndash;Saturday; click anywhere in a week's row to pick it. Struck-through weeks would break a coverage minimum and can't be picked.
+          Stage 2 of 2. Draft order is set by leftover points from Stage 1. Each partner picks one week at a time, in order, until everyone reaches {REQUIRED_VACATION_WEEKS} weeks for the year. Every week runs Sunday&ndash;Saturday; click anywhere in a week's row to pick it. Struck-through weeks would break a coverage minimum and can't be picked. Whoever's on the clock has 3 days to pick before being auto-skipped &mdash; they keep their spot in the rotation and come back around next lap.
         </p>
       </div>
 
@@ -1905,10 +1978,17 @@ function StandardPicksPhase({ currentUser, radById, vacationAuction, makeStandar
       </div>
 
       <div className="bg-white border border-[#e6e7e8] rounded-xl p-4">
-        <div className="text-sm font-medium text-[#211c35] mb-2">Your progress: {myWeeksWon}/{REQUIRED_VACATION_WEEKS} weeks</div>
+        <div className="flex items-center justify-between mb-2">
+          <div className="text-sm font-medium text-[#211c35]">Your progress: {myWeeksWon}/{REQUIRED_VACATION_WEEKS} weeks</div>
+          {isMyTurn && timeLeft !== null && (
+            <div className="flex items-center gap-1.5 text-xs font-semibold px-2 py-1 rounded-md bg-[#966eed]/10 text-[#4a449c]">
+              <Timer size={12} /> {fmtCountdownDays(timeLeft)} to pick
+            </div>
+          )}
+        </div>
         {isMyTurn ? (
           <div>
-            <div className="flex items-center justify-between mb-3">
+            <div className="flex items-center justify-between mb-3 gap-2">
               <button
                 onClick={() => setCalMonth((m) => Math.max(0, m - 1))}
                 disabled={calMonth === 0}
@@ -1916,7 +1996,17 @@ function StandardPicksPhase({ currentUser, radById, vacationAuction, makeStandar
               >
                 <ChevronLeft size={14} />
               </button>
-              <div className="text-sm font-semibold text-[#211c35]">{monthLabel}</div>
+              <select
+                value={calMonth}
+                onChange={(e) => setCalMonth(Number(e.target.value))}
+                className="text-sm font-semibold text-[#211c35] border border-[#e6e7e8] rounded-md px-2 py-1 bg-white"
+              >
+                {Array.from({ length: 12 }, (_, m) => (
+                  <option key={m} value={m}>
+                    {new Date(Date.UTC(vacationAuction.year, m, 1)).toLocaleString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' })}
+                  </option>
+                ))}
+              </select>
               <button
                 onClick={() => setCalMonth((m) => Math.min(11, m + 1))}
                 disabled={calMonth === 11}
@@ -1976,6 +2066,16 @@ function StandardPicksPhase({ currentUser, radById, vacationAuction, makeStandar
                 <AlertTriangle size={14} /> {pickError}
               </div>
             )}
+
+            <div className="mt-4 pt-3 border-t border-dashed border-[#966eed]/50">
+              <div className="text-xs text-[#222222]/60 mb-2">Real auto-skip fires on its own after 3 days of inactivity. To test that without waiting, skip this turn manually.</div>
+              <button
+                onClick={() => { if (window.confirm("Skip your turn now? You'll keep your spot in the rotation and get it back next lap, but this pick opportunity is gone.")) skipTurn(); }}
+                className="text-xs border border-[#e6e7e8] rounded-md px-3 py-1.5 hover:bg-[#f8f8f8]"
+              >
+                Skip This Turn Now (admin/testing)
+              </button>
+            </div>
           </div>
         ) : (
           <div className="text-xs text-[#222222]/60">Waiting for your turn &mdash; switch "Viewing as" to {radById(turn.radId).name} to make their pick and move the draft along.</div>
