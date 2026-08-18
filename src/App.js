@@ -109,13 +109,17 @@ const seedAuctions = () => {
 };
 
 const seedVacationRequests = () => [
-  { id: 'v-ahurlbut-1', radId: 'ahurlbut', start: '2026-08-22', end: '2026-08-23', status: 'approved', openToTrade: false },
-  { id: 'v-mfazio-1', radId: 'mfazio', start: '2026-08-10', end: '2026-08-14', status: 'approved', openToTrade: false },
-  { id: 'v-bking-1', radId: 'bking', start: '2026-08-20', end: '2026-08-21', status: 'approved', openToTrade: false },
-  { id: 'v-zhill-1', radId: 'zhill', start: '2026-09-01', end: '2026-09-05', status: 'approved', openToTrade: false },
-  { id: 'v-nhilpipre-1', radId: 'nhilpipre', start: '2026-09-10', end: '2026-09-12', status: 'approved', openToTrade: false },
-  { id: 'v-jchoi-1', radId: 'jchoi', start: '2026-10-01', end: '2026-10-03', status: 'approved', openToTrade: true },
-  { id: 'v-scarbajal-1', radId: 'scarbajal', start: '2026-10-15', end: '2026-10-17', status: 'approved', openToTrade: true },
+  { id: 'v-ahurlbut-1', radId: 'ahurlbut', start: '2026-08-22', end: '2026-08-23', status: 'approved', openToTrade: false, days: dateRange('2026-08-22', '2026-08-23'), flexibleDays: [], swapLog: [] },
+  { id: 'v-mfazio-1', radId: 'mfazio', start: '2026-08-10', end: '2026-08-14', status: 'approved', openToTrade: false, days: dateRange('2026-08-10', '2026-08-14'), flexibleDays: ['2026-08-12'], swapLog: [] },
+  { id: 'v-bking-1', radId: 'bking', start: '2026-08-20', end: '2026-08-21', status: 'approved', openToTrade: false, days: dateRange('2026-08-20', '2026-08-21'), flexibleDays: [], swapLog: [] },
+  { id: 'v-zhill-1', radId: 'zhill', start: '2026-09-01', end: '2026-09-05', status: 'approved', openToTrade: false, days: dateRange('2026-09-01', '2026-09-05'), flexibleDays: ['2026-09-05'], swapLog: [] },
+  { id: 'v-nhilpipre-1', radId: 'nhilpipre', start: '2026-09-10', end: '2026-09-12', status: 'approved', openToTrade: false, days: dateRange('2026-09-10', '2026-09-12'), flexibleDays: [], swapLog: [] },
+  { id: 'v-jchoi-1', radId: 'jchoi', start: '2026-10-01', end: '2026-10-03', status: 'approved', openToTrade: true, days: dateRange('2026-10-01', '2026-10-03'), flexibleDays: [], swapLog: [] },
+  { id: 'v-scarbajal-1', radId: 'scarbajal', start: '2026-10-15', end: '2026-10-17', status: 'approved', openToTrade: true, days: dateRange('2026-10-15', '2026-10-17'), flexibleDays: [], swapLog: [] },
+];
+
+const seedDayTrades = () => [
+  { id: 'dt1', requestAId: 'v-mfazio-1', dateA: '2026-08-12', requestBId: 'v-zhill-1', dateB: '2026-09-05', proposedBy: 'zhill', status: 'pending' },
 ];
 
 const seedTrades = () => [
@@ -202,6 +206,7 @@ export default function App() {
   const [auctions, setAuctions] = useState(seedAuctions);
   const [vacationRequests, setVacationRequests] = useState(seedVacationRequests);
   const [trades, setTrades] = useState(seedTrades);
+  const [dayTrades, setDayTrades] = useState(seedDayTrades);
   const [showPostForm, setShowPostForm] = useState(false);
   const [postForm, setPostForm] = useState({ label: 'Overnight Call', date: '', startPrice: START_PRICE, specialty: RADIOLOGISTS[0].specialties[0], requiresOnSite: true });
   const [vacForm, setVacForm] = useState({ start: '2026-08-22', end: '2026-08-24' });
@@ -229,7 +234,7 @@ export default function App() {
       if (!r.specialties.includes(specialty) || r.id === excludeRadId) return;
       const isOff = vacationRequests.some((v) =>
         v.radId === r.id && (v.status === 'approved' || v.status === 'overridden') &&
-        !excludeReqIds.includes(v.id) && dateStr >= v.start && dateStr <= v.end
+        !excludeReqIds.includes(v.id) && v.days.includes(dateStr)
       );
       if (!isOff) count++;
     });
@@ -254,6 +259,16 @@ export default function App() {
     violations.forEach((v) => { bySpecialty[v.specialty] = (bySpecialty[v.specialty] || 0) + 1; });
     return Object.entries(bySpecialty).map(([sp, days]) => `${sp} below minimum on ${days} day${days > 1 ? 's' : ''}`);
   }
+  // Single-day swap coverage check: reuses checkRange with start===end (dateRange collapses
+  // to one day), excluding both requests so the swap is evaluated cleanly against everyone else.
+  function checkDaySwap(trade) {
+    const reqA = vacationRequests.find((v) => v.id === trade.requestAId);
+    const reqB = vacationRequests.find((v) => v.id === trade.requestBId);
+    if (!reqA || !reqB) return { violA: [], violB: [] };
+    const violA = checkRange(reqA.radId, trade.dateB, trade.dateB, [reqA.id, reqB.id]);
+    const violB = checkRange(reqB.radId, trade.dateA, trade.dateA, [reqA.id, reqB.id]);
+    return { violA, violB };
+  }
 
   const vacPreviewViolations = currentUser && vacForm.start && vacForm.end && vacForm.end >= vacForm.start
     ? checkRange(currentUserId, vacForm.start, vacForm.end) : [];
@@ -265,6 +280,7 @@ export default function App() {
     setVacationRequests((prev) => [...prev, {
       id, radId: currentUserId, start: vacForm.start, end: vacForm.end,
       status: violations.length ? 'flagged' : 'approved', openToTrade: false,
+      days: dateRange(vacForm.start, vacForm.end), flexibleDays: [], swapLog: [],
     }]);
   }
   function overrideRequest(id) {
@@ -282,6 +298,19 @@ export default function App() {
   const idsInPendingTrades = new Set(
     trades.filter((t) => t.status === 'pending').flatMap((t) => [t.reqAId, t.reqBId])
   );
+  // "Pending for me" = the board listing being proposed against belongs to the current user,
+  // i.e. someone is waiting on their yes/no. Drives both the "For You" panel and the nav badge.
+  const pendingTradesForMe = trades.filter((t) => {
+    if (t.status !== 'pending') return false;
+    const reqB = vacationRequests.find((v) => v.id === t.reqBId);
+    return reqB && reqB.radId === currentUserId;
+  });
+  const pendingDayTradesForMe = dayTrades.filter((t) => {
+    if (t.status !== 'pending') return false;
+    const reqB = vacationRequests.find((v) => v.id === t.requestBId);
+    return reqB && reqB.radId === currentUserId;
+  });
+  const notificationCount = pendingTradesForMe.length + pendingDayTradesForMe.length;
 
   function reviewTrade(trade) {
     const reqA = vacationRequests.find((v) => v.id === trade.reqAId);
@@ -297,8 +326,8 @@ export default function App() {
     const violA = review ? review.violA : checkRange(reqA.radId, reqB.start, reqB.end, [reqA.id, reqB.id]);
     const violB = review ? review.violB : checkRange(reqB.radId, reqA.start, reqA.end, [reqA.id, reqB.id]);
     setVacationRequests((prev) => prev.map((v) => {
-      if (v.id === reqA.id) return { ...v, start: reqB.start, end: reqB.end, status: violA.length ? 'overridden' : 'approved', openToTrade: false };
-      if (v.id === reqB.id) return { ...v, start: reqA.start, end: reqA.end, status: violB.length ? 'overridden' : 'approved', openToTrade: false };
+      if (v.id === reqA.id) return { ...v, start: reqB.start, end: reqB.end, days: reqB.days, status: violA.length ? 'overridden' : 'approved', openToTrade: false };
+      if (v.id === reqB.id) return { ...v, start: reqA.start, end: reqA.end, days: reqA.days, status: violB.length ? 'overridden' : 'approved', openToTrade: false };
       return v;
     }));
     setTrades((prev) => prev.map((t) => t.id === trade.id ? { ...t, status: 'completed' } : t));
@@ -315,6 +344,56 @@ export default function App() {
     }]);
     setProposalTarget(null);
     setProposalMyReq('');
+  }
+
+  // ---------- Single-day swaps ----------
+  // Lighter-weight than a whole-week trade: a rad flags one or two specific days within an
+  // approved week as flexible, and another rad can offer one of their own flexible days in
+  // exchange. Only the two specific dates change hands — the rest of each person's week
+  // (and their overall day count for the year) stays the same.
+  function toggleFlexibleDay(requestId, date) {
+    setVacationRequests((prev) => prev.map((v) => {
+      if (v.id !== requestId) return v;
+      const isFlex = v.flexibleDays.includes(date);
+      return { ...v, flexibleDays: isFlex ? v.flexibleDays.filter((d) => d !== date) : [...v.flexibleDays, date] };
+    }));
+  }
+  const idsInPendingDayTrades = new Set(
+    dayTrades.filter((t) => t.status === 'pending').flatMap((t) => [`${t.requestAId}:${t.dateA}`, `${t.requestBId}:${t.dateB}`])
+  );
+  function proposeDayTrade(myRequestId, myDate, targetRequestId, targetDate) {
+    const id = 'dt-' + Date.now();
+    setDayTrades((prev) => [...prev, {
+      id, requestAId: myRequestId, dateA: myDate, requestBId: targetRequestId, dateB: targetDate,
+      proposedBy: currentUserId, status: 'pending',
+    }]);
+  }
+  function declineDayTrade(id) {
+    setDayTrades((prev) => prev.map((t) => t.id === id ? { ...t, status: 'declined' } : t));
+  }
+  function finalizeDayTrade(trade) {
+    const reqA = vacationRequests.find((v) => v.id === trade.requestAId);
+    const reqB = vacationRequests.find((v) => v.id === trade.requestBId);
+    setVacationRequests((prev) => prev.map((v) => {
+      if (v.id === trade.requestAId) {
+        return {
+          ...v,
+          days: v.days.map((d) => d === trade.dateA ? trade.dateB : d),
+          flexibleDays: v.flexibleDays.filter((d) => d !== trade.dateA),
+          swapLog: [...v.swapLog, { gaveUp: trade.dateA, tookOn: trade.dateB, withRadId: reqB.radId }],
+        };
+      }
+      if (v.id === trade.requestBId) {
+        return {
+          ...v,
+          days: v.days.map((d) => d === trade.dateB ? trade.dateA : d),
+          flexibleDays: v.flexibleDays.filter((d) => d !== trade.dateB),
+          swapLog: [...v.swapLog, { gaveUp: trade.dateB, tookOn: trade.dateA, withRadId: reqA.radId }],
+        };
+      }
+      return v;
+    }));
+    setDayTrades((prev) => prev.map((t) => t.id === trade.id ? { ...t, status: 'completed' } : t));
   }
 
   // ---------- Auctions ----------
@@ -462,7 +541,7 @@ export default function App() {
         </div>
         <nav className="flex-1 px-3 py-4 space-y-1">
           <NavItem icon={Gavel} label="Shift Marketplace" active={tab === 'auction'} onClick={() => setTab('auction')} />
-          <NavItem icon={ArrowRightLeft} label="Vacation & Trades" active={tab === 'vacation'} onClick={() => setTab('vacation')} />
+          <NavItem icon={ArrowRightLeft} label="Vacation & Trades" active={tab === 'vacation'} onClick={() => setTab('vacation')} badgeCount={notificationCount} />
           <NavItem icon={Repeat} label="Annual Call Auction" active={tab === 'annual'} onClick={() => setTab('annual')} />
           <NavItem icon={ShieldCheck} label="Coverage Map" active={tab === 'coverage'} onClick={() => setTab('coverage')} />
         </nav>
@@ -517,6 +596,10 @@ export default function App() {
               finalizeTrade={finalizeTrade} declineTrade={declineTrade}
               proposalTarget={proposalTarget} setProposalTarget={setProposalTarget}
               proposalMyReq={proposalMyReq} setProposalMyReq={setProposalMyReq} proposeTrade={proposeTrade}
+              dayTrades={dayTrades} idsInPendingDayTrades={idsInPendingDayTrades}
+              toggleFlexibleDay={toggleFlexibleDay} proposeDayTrade={proposeDayTrade}
+              declineDayTrade={declineDayTrade} finalizeDayTrade={finalizeDayTrade} checkDaySwap={checkDaySwap}
+              pendingTradesForMe={pendingTradesForMe} pendingDayTradesForMe={pendingDayTradesForMe}
             />
           )}
           {tab === 'coverage' && (
@@ -540,7 +623,7 @@ export default function App() {
   );
 }
 
-function NavItem({ icon: Icon, label, active, onClick }) {
+function NavItem({ icon: Icon, label, active, onClick, badgeCount }) {
   return (
     <button
       onClick={onClick}
@@ -549,7 +632,12 @@ function NavItem({ icon: Icon, label, active, onClick }) {
       }`}
     >
       <Icon size={16} />
-      {label}
+      <span className="flex-1 text-left">{label}</span>
+      {badgeCount > 0 && (
+        <span className="text-[10px] font-bold bg-[#966eed] text-white rounded-full min-w-[18px] h-[18px] flex items-center justify-center px-1">
+          {badgeCount}
+        </span>
+      )}
     </button>
   );
 }
@@ -753,15 +841,69 @@ function AuctionCard({ auction, currentUser, radById, claimShift, raisePrice, wi
 }
 
 // ================= Vacation Tab =================
-function VacationTab({ currentUser, radById, vacationRequests, vacForm, setVacForm, vacPreviewViolations, summarizeViolations, submitVacationRequest, overrideRequest, withdrawRequest, toggleOpenToTrade, idsInPendingTrades, trades, tradeReview, reviewTrade, finalizeTrade, declineTrade, proposalTarget, setProposalTarget, proposalMyReq, setProposalMyReq, proposeTrade }) {
+function VacationTab({
+  currentUser, radById, vacationRequests, vacForm, setVacForm, vacPreviewViolations, summarizeViolations,
+  submitVacationRequest, overrideRequest, withdrawRequest, toggleOpenToTrade, idsInPendingTrades,
+  trades, tradeReview, reviewTrade, finalizeTrade, declineTrade,
+  proposalTarget, setProposalTarget, proposalMyReq, setProposalMyReq, proposeTrade,
+  dayTrades, idsInPendingDayTrades, toggleFlexibleDay, proposeDayTrade, declineDayTrade, finalizeDayTrade, checkDaySwap,
+  pendingTradesForMe, pendingDayTradesForMe,
+}) {
   const myRequests = vacationRequests.filter((v) => v.radId === currentUser.id);
   const boardListings = vacationRequests.filter((v) =>
     v.openToTrade && v.radId !== currentUser.id && v.status === 'approved' && !idsInPendingTrades.has(v.id)
   );
   const myEligibleToOffer = myRequests.filter((v) => v.status === 'approved' && !idsInPendingTrades.has(v.id));
 
+  // Single-day listings: every other radiologist's flexible days that aren't already tied
+  // up in a pending day trade.
+  const dayListings = [];
+  vacationRequests.forEach((v) => {
+    if (v.radId === currentUser.id || v.status !== 'approved') return;
+    v.flexibleDays.forEach((date) => {
+      if (!idsInPendingDayTrades.has(`${v.id}:${date}`)) dayListings.push({ requestId: v.id, radId: v.radId, date });
+    });
+  });
+  const myFlexibleDays = [];
+  myRequests.forEach((v) => {
+    if (v.status !== 'approved') return;
+    v.flexibleDays.forEach((date) => {
+      if (!idsInPendingDayTrades.has(`${v.id}:${date}`)) myFlexibleDays.push({ requestId: v.id, date });
+    });
+  });
+
+  const hasNotifications = pendingTradesForMe.length + pendingDayTradesForMe.length > 0;
+
   return (
     <div className="max-w-3xl space-y-8">
+      {hasNotifications && (
+        <div className="bg-white border-2 border-[#966eed] rounded-xl p-4">
+          <div className="flex items-center gap-1.5 text-sm font-semibold text-[#211c35] mb-2">
+            <Bell size={15} className="text-[#966eed]" /> Waiting on you ({pendingTradesForMe.length + pendingDayTradesForMe.length})
+          </div>
+          <div className="space-y-1.5">
+            {pendingTradesForMe.map((t) => {
+              const reqA = vacationRequests.find((v) => v.id === t.reqAId);
+              return (
+                <div key={t.id} className="text-xs text-[#222222]/80 flex items-center gap-1.5">
+                  <ChevronRight size={12} className="text-[#966eed]" />
+                  {radById(reqA.radId).name} wants to trade weeks with you &mdash; see Pending trades below.
+                </div>
+              );
+            })}
+            {pendingDayTradesForMe.map((t) => {
+              const reqA = vacationRequests.find((v) => v.id === t.requestAId);
+              return (
+                <div key={t.id} className="text-xs text-[#222222]/80 flex items-center gap-1.5">
+                  <ChevronRight size={12} className="text-[#966eed]" />
+                  {radById(reqA.radId).name} offered {fmtShort(t.dateA)} for your {fmtShort(t.dateB)} &mdash; see Pending day swaps below.
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
       <div>
         <h3 className="text-sm font-semibold text-[#211c35] mb-2">Request time off</h3>
         <div className="bg-white border border-[#e6e7e8] rounded-xl p-4">
@@ -804,7 +946,8 @@ function VacationTab({ currentUser, radById, vacationRequests, vacForm, setVacFo
           {myRequests.length === 0 && <div className="text-sm text-[#222222]/50">No requests yet.</div>}
           {myRequests.map((v) => (
             <RequestRow key={v.id} v={v} radById={radById} overrideRequest={overrideRequest} withdrawRequest={withdrawRequest}
-              toggleOpenToTrade={toggleOpenToTrade} lockedInTrade={idsInPendingTrades.has(v.id)} />
+              toggleOpenToTrade={toggleOpenToTrade} lockedInTrade={idsInPendingTrades.has(v.id)}
+              toggleFlexibleDay={toggleFlexibleDay} />
           ))}
         </div>
       </div>
@@ -818,9 +961,9 @@ function VacationTab({ currentUser, radById, vacationRequests, vacForm, setVacFo
         </div>
       </div>
 
-      {/* Trade board */}
+      {/* Whole-week trade board */}
       <div>
-        <h3 className="text-sm font-semibold text-[#211c35] mb-2 flex items-center gap-1.5"><Tag size={14} /> Vacation trade board</h3>
+        <h3 className="text-sm font-semibold text-[#211c35] mb-2 flex items-center gap-1.5"><Tag size={14} /> Whole-week trade board</h3>
         <p className="text-xs text-[#222222]/60 mb-2">Weeks colleagues have posted as open to trade. Propose one of your own approved weeks in exchange.</p>
         <div className="space-y-2">
           {boardListings.length === 0 && <div className="text-sm text-[#222222]/50">No weeks posted for trade right now.</div>}
@@ -879,13 +1022,91 @@ function VacationTab({ currentUser, radById, vacationRequests, vacForm, setVacFo
         </div>
       </div>
 
+      {/* Single-day swap board */}
       <div>
-        <h3 className="text-sm font-semibold text-[#211c35] mb-2 flex items-center gap-1.5"><ArrowRightLeft size={14} /> Pending & completed trades</h3>
+        <h3 className="text-sm font-semibold text-[#211c35] mb-2 flex items-center gap-1.5"><Repeat size={14} /> Single-day swap board</h3>
+        <p className="text-xs text-[#222222]/60 mb-2">Most trades are really just a day or two. Mark specific days within an approved week as flexible (from "My requests" above) and swap them here without touching the rest of your week.</p>
+        <div className="space-y-2">
+          {dayListings.length === 0 && <div className="text-sm text-[#222222]/50">No single days posted for swap right now.</div>}
+          {dayListings.map((listing) => {
+            const rad = radById(listing.radId);
+            const key = `${listing.requestId}:${listing.date}`;
+            const isProposing = proposalTarget === key;
+            return (
+              <div key={key} className="bg-white border border-[#e6e7e8] rounded-lg px-4 py-3 text-sm">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-3">
+                    <span className="font-medium text-[#211c35]">{rad.name}</span>
+                    <SpecialtyBadges specialties={rad.specialties} />
+                    <span className="text-[#222222]/60">{fmtShort(listing.date)}</span>
+                  </div>
+                  {!isProposing && (
+                    <button
+                      onClick={() => { setProposalTarget(key); setProposalMyReq(''); }}
+                      className="text-xs bg-[#635cc6] hover:bg-[#4a449c] text-white px-3 py-1.5 rounded-md"
+                    >
+                      Offer a day
+                    </button>
+                  )}
+                </div>
+                {isProposing && (
+                  <div className="mt-3 pt-3 border-t border-[#e6e7e8]">
+                    {myFlexibleDays.length === 0 ? (
+                      <div className="text-xs text-[#222222]/50">Mark one of your own days as flexible first (in "My requests" above) before you can offer a swap.</div>
+                    ) : (
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs text-[#222222]/60">Offer:</span>
+                        <select
+                          value={proposalMyReq}
+                          onChange={(e) => setProposalMyReq(e.target.value)}
+                          className="border border-[#e6e7e8] rounded-md px-2 py-1.5 text-xs"
+                        >
+                          <option value="">Select your day&hellip;</option>
+                          {myFlexibleDays.map((d) => (
+                            <option key={`${d.requestId}:${d.date}`} value={`${d.requestId}:${d.date}`}>{fmtShort(d.date)}</option>
+                          ))}
+                        </select>
+                        <button
+                          disabled={!proposalMyReq}
+                          onClick={() => {
+                            const [myRequestId, myDate] = proposalMyReq.split(':');
+                            proposeDayTrade(myRequestId, myDate, listing.requestId, listing.date);
+                            setProposalTarget(null);
+                            setProposalMyReq('');
+                          }}
+                          className="text-xs bg-[#211c35] disabled:opacity-40 text-white px-3 py-1.5 rounded-md"
+                        >
+                          Send Offer
+                        </button>
+                        <button onClick={() => setProposalTarget(null)} className="text-xs text-[#222222]/60 px-2 py-1.5">Cancel</button>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      <div>
+        <h3 className="text-sm font-semibold text-[#211c35] mb-2 flex items-center gap-1.5"><ArrowRightLeft size={14} /> Pending & completed whole-week trades</h3>
         <div className="space-y-3">
           {trades.length === 0 && <div className="text-sm text-[#222222]/50">No trades yet.</div>}
           {trades.map((t) => (
             <TradeCard key={t.id} t={t} vacationRequests={vacationRequests} radById={radById} summarizeViolations={summarizeViolations}
               review={tradeReview[t.id]} reviewTrade={reviewTrade} finalizeTrade={finalizeTrade} declineTrade={declineTrade} />
+          ))}
+        </div>
+      </div>
+
+      <div>
+        <h3 className="text-sm font-semibold text-[#211c35] mb-2 flex items-center gap-1.5"><Repeat size={14} /> Pending & completed day swaps</h3>
+        <div className="space-y-3">
+          {dayTrades.length === 0 && <div className="text-sm text-[#222222]/50">No day swaps yet.</div>}
+          {dayTrades.map((t) => (
+            <DayTradeCard key={t.id} t={t} vacationRequests={vacationRequests} radById={radById}
+              checkDaySwap={checkDaySwap} finalizeDayTrade={finalizeDayTrade} declineDayTrade={declineDayTrade} />
           ))}
         </div>
       </div>
@@ -900,38 +1121,77 @@ function statusStyle(status) {
   return 'bg-[#e6e7e8] text-[#222222]/60';
 }
 
-function RequestRow({ v, radById, overrideRequest, withdrawRequest, readOnly, toggleOpenToTrade, lockedInTrade }) {
+function RequestRow({ v, radById, overrideRequest, withdrawRequest, readOnly, toggleOpenToTrade, lockedInTrade, toggleFlexibleDay }) {
   const rad = radById(v.radId);
+  const [showDayPicker, setShowDayPicker] = useState(false);
   return (
-    <div className="bg-white border border-[#e6e7e8] rounded-lg px-4 py-3 flex items-center justify-between text-sm">
-      <div className="flex items-center gap-3">
-        <span className="font-medium text-[#211c35]">{rad.name}</span>
-        <SpecialtyBadges specialties={rad.specialties} />
-        {rad.remote && <RemoteBadge />}
-        <span className="text-[#222222]/60">{fmtShort(v.start)} &ndash; {fmtShort(v.end)}</span>
-        {v.openToTrade && <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-[#635cc6]/10 text-[#4a449c] flex items-center gap-1"><Tag size={10} /> On trade board</span>}
+    <div className="bg-white border border-[#e6e7e8] rounded-lg px-4 py-3 text-sm">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <span className="font-medium text-[#211c35]">{rad.name}</span>
+          <SpecialtyBadges specialties={rad.specialties} />
+          {rad.remote && <RemoteBadge />}
+          <span className="text-[#222222]/60">{fmtShort(v.start)} &ndash; {fmtShort(v.end)}</span>
+          {v.openToTrade && <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-[#635cc6]/10 text-[#4a449c] flex items-center gap-1"><Tag size={10} /> On trade board</span>}
+          {v.flexibleDays.length > 0 && <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-[#966eed]/10 text-[#966eed] flex items-center gap-1"><Repeat size={10} /> {v.flexibleDays.length} day{v.flexibleDays.length === 1 ? '' : 's'} flexible</span>}
+        </div>
+        <div className="flex items-center gap-2">
+          <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${statusStyle(v.status)}`}>
+            {v.status === 'flagged' ? 'Coverage gap \u2014 needs review' : v.status}
+          </span>
+          {!readOnly && v.status === 'flagged' && (
+            <button onClick={() => overrideRequest(v.id)} className="text-xs border border-[#e6e7e8] rounded-md px-2 py-1 hover:bg-[#f8f8f8]">Override & approve</button>
+          )}
+          {!readOnly && v.status === 'approved' && toggleOpenToTrade && (
+            <button
+              onClick={() => toggleOpenToTrade(v.id)}
+              disabled={lockedInTrade}
+              title={lockedInTrade ? 'Already tied up in a pending trade' : ''}
+              className="text-xs border border-[#e6e7e8] rounded-md px-2 py-1 hover:bg-[#f8f8f8] disabled:opacity-40"
+            >
+              {v.openToTrade ? 'Remove from trade board' : 'Post whole week'}
+            </button>
+          )}
+          {!readOnly && v.status === 'approved' && toggleFlexibleDay && (
+            <button onClick={() => setShowDayPicker((s) => !s)} className="text-xs border border-[#e6e7e8] rounded-md px-2 py-1 hover:bg-[#f8f8f8]">
+              Mark days flexible
+            </button>
+          )}
+          {!readOnly && (
+            <button onClick={() => withdrawRequest(v.id)} className="text-[#222222]/40 hover:text-[#966eed]"><X size={14} /></button>
+          )}
+        </div>
       </div>
-      <div className="flex items-center gap-2">
-        <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${statusStyle(v.status)}`}>
-          {v.status === 'flagged' ? 'Coverage gap \u2014 needs review' : v.status}
-        </span>
-        {!readOnly && v.status === 'flagged' && (
-          <button onClick={() => overrideRequest(v.id)} className="text-xs border border-[#e6e7e8] rounded-md px-2 py-1 hover:bg-[#f8f8f8]">Override & approve</button>
-        )}
-        {!readOnly && v.status === 'approved' && toggleOpenToTrade && (
-          <button
-            onClick={() => toggleOpenToTrade(v.id)}
-            disabled={lockedInTrade}
-            title={lockedInTrade ? 'Already tied up in a pending trade' : ''}
-            className="text-xs border border-[#e6e7e8] rounded-md px-2 py-1 hover:bg-[#f8f8f8] disabled:opacity-40"
-          >
-            {v.openToTrade ? 'Remove from trade board' : 'Post to trade board'}
-          </button>
-        )}
-        {!readOnly && (
-          <button onClick={() => withdrawRequest(v.id)} className="text-[#222222]/40 hover:text-[#966eed]"><X size={14} /></button>
-        )}
-      </div>
+
+      {v.swapLog.length > 0 && (
+        <div className="mt-2 pt-2 border-t border-[#e6e7e8] space-y-0.5">
+          {v.swapLog.map((s, i) => (
+            <div key={i} className="text-xs text-[#222222]/50 flex items-center gap-1">
+              <Repeat size={10} /> Swapped {fmtShort(s.gaveUp)} for {fmtShort(s.tookOn)} with {radById(s.withRadId)?.name.replace('Dr. ', '')}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {showDayPicker && (
+        <div className="mt-3 pt-3 border-t border-[#e6e7e8]">
+          <div className="text-xs text-[#222222]/60 mb-2">Check the day(s) you'd trade individually &mdash; a day or two is typical, not the whole week.</div>
+          <div className="flex flex-wrap gap-2">
+            {v.days.map((date) => {
+              const isFlex = v.flexibleDays.includes(date);
+              return (
+                <button
+                  key={date}
+                  onClick={() => toggleFlexibleDay(v.id, date)}
+                  className={`text-xs px-2 py-1 rounded-md border ${isFlex ? 'bg-[#966eed]/10 border-[#966eed] text-[#966eed]' : 'border-[#e6e7e8] text-[#222222]/70 hover:bg-[#f8f8f8]'}`}
+                >
+                  {fmtShort(date)}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -988,6 +1248,59 @@ function TradeCard({ t, vacationRequests, radById, review, reviewTrade, finalize
               </div>
             </div>
           )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DayTradeCard({ t, vacationRequests, radById, checkDaySwap, finalizeDayTrade, declineDayTrade }) {
+  const reqA = vacationRequests.find((v) => v.id === t.requestAId);
+  const reqB = vacationRequests.find((v) => v.id === t.requestBId);
+  if (!reqA || !reqB) return null;
+  const radA = radById(reqA.radId), radB = radById(reqB.radId);
+  const { violA, violB } = t.status === 'pending' ? checkDaySwap(t) : { violA: [], violB: [] };
+  const hasIssues = violA.length > 0 || violB.length > 0;
+
+  return (
+    <div className="bg-white border border-[#e6e7e8] rounded-xl p-4 text-sm">
+      <div className="flex items-center justify-between">
+        <div>
+          <span className="font-medium text-[#211c35]">{radA.name}</span>
+          <span className="mx-2 text-[#222222]/40"><Repeat size={12} className="inline" /></span>
+          <span className="font-medium text-[#211c35]">{radB.name}</span>
+        </div>
+        <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${statusStyle(t.status === 'completed' ? 'approved' : t.status === 'pending' ? 'flagged' : '')}`}>
+          {t.status}
+        </span>
+      </div>
+      <div className="text-[#222222]/60 text-xs mt-1">
+        {radA.name.replace('Dr. ', '')} gives up {fmtShort(t.dateA)} for {fmtShort(t.dateB)}
+        <span className="mx-2">|</span>
+        {radB.name.replace('Dr. ', '')} gives up {fmtShort(t.dateB)} for {fmtShort(t.dateA)}
+      </div>
+
+      {t.status === 'pending' && (
+        <div className="mt-3">
+          {hasIssues ? (
+            <div className="flex items-start gap-2 text-xs text-[#966eed] bg-[#966eed]/10 rounded-md px-3 py-2 mb-2">
+              <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+              <span>
+                {violA.length > 0 && <>{radA.name.replace('Dr. ', '')}: {violA.length} coverage gap on {fmtShort(t.dateB)}. </>}
+                {violB.length > 0 && <>{radB.name.replace('Dr. ', '')}: {violB.length} coverage gap on {fmtShort(t.dateA)}.</>}
+              </span>
+            </div>
+          ) : (
+            <div className="flex items-center gap-2 text-xs text-[#4a449c] bg-[#635cc6]/10 rounded-md px-3 py-2 mb-2">
+              <CheckCircle2 size={14} /> No coverage impact &mdash; safe to confirm.
+            </div>
+          )}
+          <div className="flex gap-2">
+            <button onClick={() => finalizeDayTrade(t)} className="bg-[#635cc6] hover:bg-[#4a449c] text-white text-xs font-medium px-3 py-1.5 rounded-md">
+              {hasIssues ? 'Override & Confirm Swap' : 'Confirm Swap'}
+            </button>
+            <button onClick={() => declineDayTrade(t.id)} className="text-xs text-[#222222]/60 px-3 py-1.5">Decline</button>
+          </div>
         </div>
       )}
     </div>
