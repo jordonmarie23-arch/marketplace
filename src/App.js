@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Calendar, Users, AlertTriangle, CheckCircle2, MapPin, Wifi, Plus, X, ArrowRightLeft, ShieldCheck, ChevronRight, Scale, DollarSign, Gavel, History, TrendingUp, Ban, Tag, Repeat, EyeOff, Timer, Bell } from 'lucide-react';
+import { Calendar, Users, AlertTriangle, CheckCircle2, MapPin, Wifi, Plus, X, ArrowRightLeft, ShieldCheck, ChevronRight, ChevronLeft, Scale, DollarSign, Gavel, History, TrendingUp, Ban, Tag, Repeat, EyeOff, Timer, Bell } from 'lucide-react';
 
 // ---------- Static config ----------
 // NOTE: Cardiac and PET were added because they show up as subspecialties in the
@@ -7,6 +7,9 @@ import { Calendar, Users, AlertTriangle, CheckCircle2, MapPin, Wifi, Plus, X, Ar
 // since they weren't specified — adjust COVERAGE_MIN if that's wrong.
 const SPECIALTIES = ['General', 'MSK', 'Breast', 'Neuro', 'IR', 'Body', 'Peds', 'Cardiac', 'PET'];
 const COVERAGE_MIN = { General: 2, MSK: 2, Breast: 3, Neuro: 2, IR: 3, Body: 2, Peds: 2, Cardiac: 1, PET: 1 };
+// Separate from the per-specialty minimums above: a hard cap on how many radiologists,
+// network-wide, can be off on the same day regardless of specialty mix.
+const MAX_SIMULTANEOUS_OFF = 5;
 
 // name() builds a display name that respects title: MDs/DOs get "Dr.", PAs get a ", PA"
 // suffix instead, and blank/unknown titles get neither.
@@ -71,6 +74,37 @@ const dateRange = (start, end) => {
 };
 const fmtShort = (d) => new Date(d + 'T00:00:00Z').toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' });
 const fmtMoney = (n) => '$' + n.toLocaleString();
+// Every standard-week draft pick is Sunday–Saturday. Generates all such weeks whose Sunday
+// falls within the given calendar year (the last week may run a few days into January).
+const sundaysInYear = (year) => {
+  let d = toDay(`${year}-01-01`);
+  const dow = new Date(d * 86400000).getUTCDay(); // 0 = Sunday
+  if (dow !== 0) d += (7 - dow);
+  const yearEndDay = toDay(`${year}-12-31`);
+  const weeks = [];
+  while (d <= yearEndDay) {
+    weeks.push({ start: fromDay(d), end: fromDay(d + 6) });
+    d += 7;
+  }
+  return weeks;
+};
+// Standard month-grid rows (Sun–Sat) for rendering an actual calendar, including the
+// overflow days from the adjacent month needed to complete the first/last row.
+const monthGridWeeks = (year, month) => {
+  const firstOfMonth = Math.floor(Date.UTC(year, month, 1) / 86400000);
+  const dow = new Date(firstOfMonth * 86400000).getUTCDay();
+  let cursor = firstOfMonth - dow;
+  const daysInMonth = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
+  const lastOfMonth = Math.floor(Date.UTC(year, month, daysInMonth) / 86400000);
+  const weeks = [];
+  while (cursor <= lastOfMonth) {
+    const days = [];
+    for (let i = 0; i < 7; i++) days.push(fromDay(cursor + i));
+    weeks.push(days);
+    cursor += 7;
+  }
+  return weeks;
+};
 
 // ---------- Seed data ----------
 const START_PRICE = 15000;
@@ -200,15 +234,19 @@ const fmtCountdownDays = (ms) => {
 
 // ---------- Annual vacation-week priority auction ----------
 // Unlike weekend call (fungible units, anonymous pooling), a specific vacation week matters
-// to the person requesting it, so this isn't a quantity auction. It's a sealed-bid priority
-// draft scoped to a defined set of high-demand holiday weeks — everything else still goes
-// through the normal Vacation & Trades request flow. Each partner gets a fixed annual points
-// budget to spend across whichever holiday weeks they actually care about; a losing bid costs
-// nothing (points aren't spent until you win). Capacity per week isn't a made-up seat count —
-// it's whatever the existing coverage-minimum engine actually allows, checked greedily from
-// the highest bidder down.
-// NOTE: these dates are placeholders — swap in the practice's actual observed holiday weeks.
+// to the person requesting it, so this isn't a quantity auction. Every one of a partner's 12
+// required weeks is now assigned through this process, in two stages:
+//   1. Holiday-week sealed-bid points auction (a fixed set of high-demand weeks). A losing bid
+//      costs nothing — points aren't spent until you win.
+//   2. Standard-week draft for the remaining weeks each partner still needs. Draft order is set
+//      by leftover points after stage 1 (spend less on holidays, pick earlier here). Partners
+//      take turns picking any coverage-safe week; an infeasible pick is blocked outright rather
+//      than flagged, since this is a draft, not a request queue.
+// Vacation & Trades no longer has a free-form "request time off" form — every week comes from
+// this process, and that tab is for trading what's already been assigned.
+// NOTE: holiday dates are placeholders — swap in the practice's actual observed holiday weeks.
 const ANNUAL_VACATION_POINTS = 100;
+const REQUIRED_VACATION_WEEKS = 12;
 const HOLIDAY_WEEKS = [
   { id: 'newyears', label: "New Year's Week", start: '2027-01-01', end: '2027-01-03' },
   { id: 'memorial', label: 'Memorial Day Week', start: '2027-05-29', end: '2027-05-31' },
@@ -219,7 +257,23 @@ const HOLIDAY_WEEKS = [
 ];
 
 function initialVacationAuction(year) {
-  return { year, phase: 'bidding', bids: [], results: null };
+  return {
+    year, phase: 'holiday-bidding', bids: [], results: null,
+    draftOrder: null, weeksWon: null, turnCursor: 0, standardPicks: [],
+  };
+}
+
+// Whose turn is it in the standard-week draft: walk forward from turnCursor through draftOrder
+// (wrapping) for anyone still under REQUIRED_VACATION_WEEKS. Returns null once everyone's done.
+function getCurrentTurn(vacationAuction) {
+  const { draftOrder, weeksWon, turnCursor } = vacationAuction;
+  if (!draftOrder || !draftOrder.length) return null;
+  for (let i = 0; i < draftOrder.length; i++) {
+    const idx = (turnCursor + i) % draftOrder.length;
+    const radId = draftOrder[idx];
+    if ((weeksWon[radId] || 0) < REQUIRED_VACATION_WEEKS) return { radId, idx };
+  }
+  return null;
 }
 
 // Standalone (non-hook) coverage check so the greedy draft-clearing pass can evaluate each
@@ -237,6 +291,14 @@ function checkRangeAgainstPure(requests, radId, start, end) {
       });
       if (count < COVERAGE_MIN[sp]) violations.push({ date: d, specialty: sp, avail: count, min: COVERAGE_MIN[sp] });
     });
+    let offCount = 0;
+    RADIOLOGISTS.forEach((r) => {
+      if (r.id === radId) return;
+      const isOff = requests.some((v) => v.radId === r.id && (v.status === 'approved' || v.status === 'overridden') && v.days.includes(d));
+      if (isOff) offCount++;
+    });
+    offCount += 1;
+    if (offCount > MAX_SIMULTANEOUS_OFF) violations.push({ date: d, specialty: 'Network-wide cap', avail: MAX_SIMULTANEOUS_OFF, min: MAX_SIMULTANEOUS_OFF, off: offCount });
   });
   return violations;
 }
@@ -252,7 +314,6 @@ export default function App() {
   const [dayTrades, setDayTrades] = useState(seedDayTrades);
   const [showPostForm, setShowPostForm] = useState(false);
   const [postForm, setPostForm] = useState({ label: 'Overnight Call', date: '', startPrice: START_PRICE, specialty: RADIOLOGISTS[0].specialties[0], requiresOnSite: true });
-  const [vacForm, setVacForm] = useState({ start: '2026-08-22', end: '2026-08-24' });
   const [tradeReview, setTradeReview] = useState({});
   const [proposalTarget, setProposalTarget] = useState(null); // id of board listing being proposed against
   const [proposalMyReq, setProposalMyReq] = useState('');
@@ -284,8 +345,24 @@ export default function App() {
     });
     return count;
   }
+  // How many radiologists, network-wide, are already off on this day (regardless of
+  // specialty) — feeds the MAX_SIMULTANEOUS_OFF cap, which is separate from and in addition
+  // to the per-specialty minimums.
+  function totalOffCount(dateStr, excludeRadId, excludeReqIds = []) {
+    let count = 0;
+    RADIOLOGISTS.forEach((r) => {
+      if (r.id === excludeRadId) return;
+      const isOff = vacationRequests.some((v) =>
+        v.radId === r.id && (v.status === 'approved' || v.status === 'overridden') &&
+        !excludeReqIds.includes(v.id) && v.days.includes(dateStr)
+      );
+      if (isOff) count++;
+    });
+    return count;
+  }
   // Vacation for a multi-specialty radiologist can affect coverage on every specialty
-  // they cover, not just one, so this checks all of them across the date range.
+  // they cover, not just one, so this checks all of them across the date range — plus the
+  // network-wide simultaneous-off cap, which applies regardless of specialty.
   function checkRange(radId, start, end, excludeReqIds = []) {
     const rad = radById(radId);
     const violations = [];
@@ -295,13 +372,21 @@ export default function App() {
         const min = COVERAGE_MIN[sp];
         if (avail < min) violations.push({ date: d, specialty: sp, avail, min });
       });
+      const offCount = totalOffCount(d, radId, excludeReqIds) + 1;
+      if (offCount > MAX_SIMULTANEOUS_OFF) {
+        violations.push({ date: d, specialty: 'Network-wide cap', avail: MAX_SIMULTANEOUS_OFF, min: MAX_SIMULTANEOUS_OFF, off: offCount });
+      }
     });
     return violations;
   }
   function summarizeViolations(violations) {
     const bySpecialty = {};
     violations.forEach((v) => { bySpecialty[v.specialty] = (bySpecialty[v.specialty] || 0) + 1; });
-    return Object.entries(bySpecialty).map(([sp, days]) => `${sp} below minimum on ${days} day${days > 1 ? 's' : ''}`);
+    return Object.entries(bySpecialty).map(([sp, days]) =>
+      sp === 'Network-wide cap'
+        ? `over the ${MAX_SIMULTANEOUS_OFF}-person network-wide off cap on ${days} day${days > 1 ? 's' : ''}`
+        : `${sp} below minimum on ${days} day${days > 1 ? 's' : ''}`
+    );
   }
   // Single-day swap coverage check: reuses checkRange with start===end (dateRange collapses
   // to one day), excluding both requests so the swap is evaluated cleanly against everyone else.
@@ -314,19 +399,6 @@ export default function App() {
     return { violA, violB };
   }
 
-  const vacPreviewViolations = currentUser && vacForm.start && vacForm.end && vacForm.end >= vacForm.start
-    ? checkRange(currentUserId, vacForm.start, vacForm.end) : [];
-
-  function submitVacationRequest() {
-    if (!vacForm.start || !vacForm.end || vacForm.end < vacForm.start) return;
-    const violations = checkRange(currentUserId, vacForm.start, vacForm.end);
-    const id = 'v-' + currentUserId + '-' + Date.now();
-    setVacationRequests((prev) => [...prev, {
-      id, radId: currentUserId, start: vacForm.start, end: vacForm.end,
-      status: violations.length ? 'flagged' : 'approved', openToTrade: false,
-      days: dateRange(vacForm.start, vacForm.end), flexibleDays: [], swapLog: [],
-    }]);
-  }
   function overrideRequest(id) {
     setVacationRequests((prev) => prev.map((v) => v.id === id ? { ...v, status: 'overridden' } : v));
   }
@@ -571,7 +643,7 @@ export default function App() {
   function setVacationBid(radId, weekId, points) {
     const clamped = Math.max(0, Math.floor(points) || 0);
     setVacationAuction((prev) => {
-      if (prev.phase !== 'bidding') return prev;
+      if (prev.phase !== 'holiday-bidding') return prev;
       const others = prev.bids.filter((b) => !(b.radId === radId && b.weekId === weekId));
       const committedElsewhere = others.filter((b) => b.radId === radId).reduce((sum, b) => sum + b.points, 0);
       const capped = Math.min(clamped, Math.max(0, ANNUAL_VACATION_POINTS - committedElsewhere));
@@ -579,11 +651,14 @@ export default function App() {
       return { ...prev, bids };
     });
   }
-  function closeVacationDraft() {
+  function closeHolidayBidding() {
     setVacationAuction((prev) => {
-      if (prev.phase !== 'bidding') return prev;
+      if (prev.phase !== 'holiday-bidding') return prev;
       let working = vacationRequests.map((v) => ({ ...v }));
       const results = {};
+      const weeksWon = {};
+      const spent = {};
+      PARTNERS.forEach((p) => { weeksWon[p.id] = 0; spent[p.id] = 0; });
       HOLIDAY_WEEKS.forEach((week) => {
         const weekBids = prev.bids.filter((b) => b.weekId === week.id).sort((a, b) => b.points - a.points || a.ts - b.ts);
         const winners = [];
@@ -592,6 +667,8 @@ export default function App() {
           const viol = checkRangeAgainstPure(working, b.radId, week.start, week.end);
           if (viol.length === 0) {
             winners.push({ radId: b.radId, points: b.points });
+            weeksWon[b.radId] = (weeksWon[b.radId] || 0) + 1;
+            spent[b.radId] = (spent[b.radId] || 0) + b.points;
             working = [...working, {
               id: 'v-draft-' + week.id + '-' + b.radId, radId: b.radId, start: week.start, end: week.end,
               status: 'approved', openToTrade: false, days: dateRange(week.start, week.end),
@@ -603,9 +680,40 @@ export default function App() {
         });
         results[week.id] = { winners, notWon };
       });
+      // Draft order for the standard-week picks: most leftover points picks first.
+      const draftOrder = PARTNERS.map((p) => p.id).sort((a, b) => {
+        const leftoverA = ANNUAL_VACATION_POINTS - (spent[a] || 0);
+        const leftoverB = ANNUAL_VACATION_POINTS - (spent[b] || 0);
+        return leftoverB - leftoverA || a.localeCompare(b);
+      });
       setVacationRequests(working);
-      return { ...prev, phase: 'closed', results };
+      return { ...prev, phase: 'standard-picks', results, weeksWon, draftOrder, turnCursor: 0, standardPicks: [] };
     });
+  }
+  // A standard-week pick is only accepted if it's actually that partner's turn and it doesn't
+  // break coverage — infeasible picks are rejected outright rather than flagged for override,
+  // since this is a draft, not a request queue. Returns an error string, or null on success.
+  function makeStandardPick(radId, start, end) {
+    let error = null;
+    setVacationAuction((prev) => {
+      if (prev.phase !== 'standard-picks') { error = 'The standard-week draft is not open.'; return prev; }
+      const turn = getCurrentTurn(prev);
+      if (!turn || turn.radId !== radId) { error = "It's not your turn."; return prev; }
+      if (!start || !end || end < start) { error = 'Pick a valid date range.'; return prev; }
+      const violations = checkRange(radId, start, end);
+      if (violations.length > 0) { error = 'That week breaks coverage minimums \u2014 pick a different one.'; return prev; }
+      const id = 'v-pick-' + radId + '-' + Date.now();
+      setVacationRequests((prevReqs) => [...prevReqs, {
+        id, radId, start, end, status: 'approved', openToTrade: false,
+        days: dateRange(start, end), flexibleDays: [], swapLog: [], source: 'vacation-draft-standard',
+      }]);
+      const weeksWon = { ...prev.weeksWon, [radId]: (prev.weeksWon[radId] || 0) + 1 };
+      const standardPicks = [...prev.standardPicks, { radId, start, end }];
+      const nextState = { ...prev, weeksWon, standardPicks, turnCursor: (turn.idx + 1) % prev.draftOrder.length };
+      const nextTurn = getCurrentTurn(nextState);
+      return nextTurn ? nextState : { ...nextState, phase: 'closed' };
+    });
+    return error;
   }
   function startNextYearVacationDraft() {
     setVacationAuction((prev) => initialVacationAuction(prev.year + 1));
@@ -675,9 +783,7 @@ export default function App() {
           {tab === 'vacation' && (
             <VacationTab
               currentUser={currentUser} radById={radById}
-              vacationRequests={vacationRequests} vacForm={vacForm} setVacForm={setVacForm}
-              vacPreviewViolations={vacPreviewViolations} summarizeViolations={summarizeViolations}
-              submitVacationRequest={submitVacationRequest}
+              vacationRequests={vacationRequests} summarizeViolations={summarizeViolations}
               overrideRequest={overrideRequest} withdrawRequest={withdrawRequest}
               toggleOpenToTrade={toggleOpenToTrade} idsInPendingTrades={idsInPendingTrades}
               trades={trades} tradeReview={tradeReview} reviewTrade={reviewTrade}
@@ -704,7 +810,8 @@ export default function App() {
               cancelBuyRequest={cancelBuyRequest} closeCurrentRound={closeCurrentRound}
               startNextYearAuction={startNextYearAuction}
               vacationAuction={vacationAuction} setVacationBid={setVacationBid}
-              closeVacationDraft={closeVacationDraft} startNextYearVacationDraft={startNextYearVacationDraft}
+              closeHolidayBidding={closeHolidayBidding} makeStandardPick={makeStandardPick} startNextYearVacationDraft={startNextYearVacationDraft}
+              checkRange={checkRange} vacationRequests={vacationRequests}
             />
           )}
         </div>
@@ -932,8 +1039,8 @@ function AuctionCard({ auction, currentUser, radById, claimShift, raisePrice, wi
 
 // ================= Vacation Tab =================
 function VacationTab({
-  currentUser, radById, vacationRequests, vacForm, setVacForm, vacPreviewViolations, summarizeViolations,
-  submitVacationRequest, overrideRequest, withdrawRequest, toggleOpenToTrade, idsInPendingTrades,
+  currentUser, radById, vacationRequests, summarizeViolations,
+  overrideRequest, withdrawRequest, toggleOpenToTrade, idsInPendingTrades,
   trades, tradeReview, reviewTrade, finalizeTrade, declineTrade,
   proposalTarget, setProposalTarget, proposalMyReq, setProposalMyReq, proposeTrade,
   dayTrades, idsInPendingDayTrades, toggleFlexibleDay, proposeDayTrade, declineDayTrade, finalizeDayTrade, checkDaySwap,
@@ -995,45 +1102,10 @@ function VacationTab({
       )}
 
       <div>
-        <h3 className="text-sm font-semibold text-[#211c35] mb-2">Request time off</h3>
-        <div className="bg-white border border-[#e6e7e8] rounded-xl p-4">
-          <div className="flex items-end gap-3">
-            <div>
-              <label className="text-xs font-medium text-[#222222]/60">Start</label>
-              <input type="date" value={vacForm.start} onChange={(e) => setVacForm({ ...vacForm, start: e.target.value })}
-                className="block mt-1 border border-[#e6e7e8] rounded-md px-2 py-1.5 text-sm" />
-            </div>
-            <div>
-              <label className="text-xs font-medium text-[#222222]/60">End</label>
-              <input type="date" value={vacForm.end} onChange={(e) => setVacForm({ ...vacForm, end: e.target.value })}
-                className="block mt-1 border border-[#e6e7e8] rounded-md px-2 py-1.5 text-sm" />
-            </div>
-            <button onClick={submitVacationRequest} className="bg-[#635cc6] hover:bg-[#4a449c] text-white text-sm font-medium px-3 py-2 rounded-md">
-              Submit Request
-            </button>
-            <span className="text-xs text-[#222222]/50">as {currentUser.name} &middot; {currentUser.specialties.join(', ')}</span>
-          </div>
-
-          {vacPreviewViolations.length > 0 ? (
-            <div className="mt-3 flex items-start gap-2 text-xs text-[#966eed] bg-[#966eed]/10 rounded-md px-3 py-2">
-              <AlertTriangle size={14} className="mt-0.5 shrink-0" />
-              <span>
-                Coverage would drop below minimum: {summarizeViolations(vacPreviewViolations).join('; ')}.
-                Submitting will flag this request for admin override instead of auto-approving.
-              </span>
-            </div>
-          ) : (
-            <div className="mt-3 flex items-center gap-2 text-xs text-[#4a449c] bg-[#635cc6]/10 rounded-md px-3 py-2">
-              <CheckCircle2 size={14} /> Coverage holds for all of {currentUser.name.replace('Dr. ', '')}'s specialties &mdash; this would auto-approve.
-            </div>
-          )}
-        </div>
-      </div>
-
-      <div>
         <h3 className="text-sm font-semibold text-[#211c35] mb-2">My requests</h3>
+        <p className="text-xs text-[#222222]/60 mb-2">All {REQUIRED_VACATION_WEEKS} of your weeks for the year come from the annual vacation-week draft (Annual Auctions &rarr; Vacation Weeks). This tab is for trading what's already been assigned.</p>
         <div className="space-y-2">
-          {myRequests.length === 0 && <div className="text-sm text-[#222222]/50">No requests yet.</div>}
+          {myRequests.length === 0 && <div className="text-sm text-[#222222]/50">No weeks assigned yet &mdash; check the annual draft.</div>}
           {myRequests.map((v) => (
             <RequestRow key={v.id} v={v} radById={radById} overrideRequest={overrideRequest} withdrawRequest={withdrawRequest}
               toggleOpenToTrade={toggleOpenToTrade} lockedInTrade={idsInPendingTrades.has(v.id)}
@@ -1456,7 +1528,8 @@ function CoverageTab({ mapDays, coverageAvailable }) {
 function AnnualAuctionTab({
   currentUser, radById, nowTick, annualAuction, sellQtyDraft, setSellQtyDraft, buyQtyDraft, setBuyQtyDraft,
   setSellCommitment, startAnnualAuction, withdrawSellUnit, withdrawAllSellUnits, submitBuyRequest, cancelBuyRequest, closeCurrentRound, startNextYearAuction,
-  vacationAuction, setVacationBid, closeVacationDraft, startNextYearVacationDraft,
+  vacationAuction, setVacationBid, closeHolidayBidding, makeStandardPick, startNextYearVacationDraft,
+  checkRange, vacationRequests,
 }) {
   const [subTab, setSubTab] = useState('call');
   const isPartner = PARTNER_TITLES.includes(currentUser.title);
@@ -1502,8 +1575,9 @@ function AnnualAuctionTab({
       ) : (
         <VacationDraftPanel
           currentUser={currentUser} radById={radById} vacationAuction={vacationAuction}
-          setVacationBid={setVacationBid} closeVacationDraft={closeVacationDraft}
-          startNextYearVacationDraft={startNextYearVacationDraft}
+          setVacationBid={setVacationBid} closeHolidayBidding={closeHolidayBidding}
+          makeStandardPick={makeStandardPick} startNextYearVacationDraft={startNextYearVacationDraft}
+          checkRange={checkRange} vacationRequests={vacationRequests}
         />
       )}
     </div>
@@ -1713,60 +1787,25 @@ function ResultsReport({ radById, annualAuction, startNextYearAuction }) {
   );
 }
 
-function VacationDraftPanel({ currentUser, radById, vacationAuction, setVacationBid, closeVacationDraft, startNextYearVacationDraft }) {
+function VacationDraftPanel({ currentUser, radById, vacationAuction, setVacationBid, closeHolidayBidding, makeStandardPick, startNextYearVacationDraft, checkRange, vacationRequests }) {
+  if (vacationAuction.phase === 'closed') {
+    return <VacationDraftClosed radById={radById} vacationAuction={vacationAuction} startNextYearVacationDraft={startNextYearVacationDraft} />;
+  }
+  if (vacationAuction.phase === 'standard-picks') {
+    return (
+      <StandardPicksPhase
+        currentUser={currentUser} radById={radById} vacationAuction={vacationAuction} makeStandardPick={makeStandardPick}
+        checkRange={checkRange} vacationRequests={vacationRequests}
+      />
+    );
+  }
+  return <HolidayBiddingPhase currentUser={currentUser} vacationAuction={vacationAuction} setVacationBid={setVacationBid} closeHolidayBidding={closeHolidayBidding} />;
+}
+
+function HolidayBiddingPhase({ currentUser, vacationAuction, setVacationBid, closeHolidayBidding }) {
   const myBids = vacationAuction.bids.filter((b) => b.radId === currentUser.id);
   const committed = myBids.reduce((sum, b) => sum + b.points, 0);
   const remaining = ANNUAL_VACATION_POINTS - committed;
-
-  if (vacationAuction.phase === 'closed') {
-    return (
-      <div className="max-w-2xl space-y-6">
-        <div className="bg-white border border-[#e6e7e8] rounded-xl p-4">
-          <div className="flex items-center gap-2 mb-1">
-            <CheckCircle2 size={16} className="text-[#4a449c]" />
-            <h3 className="text-sm font-semibold text-[#211c35]">{vacationAuction.year} vacation-week draft &mdash; results</h3>
-          </div>
-          <p className="text-xs text-[#222222]/60">Points spent only count toward weeks you actually won &mdash; a losing bid costs nothing.</p>
-        </div>
-        <div className="space-y-2">
-          {HOLIDAY_WEEKS.map((week) => {
-            const result = vacationAuction.results[week.id];
-            return (
-              <div key={week.id} className="bg-white border border-[#e6e7e8] rounded-xl p-4">
-                <div className="flex items-center justify-between mb-2">
-                  <span className="font-medium text-[#211c35]">{week.label}</span>
-                  <span className="text-xs text-[#222222]/50">{fmtShort(week.start)} &ndash; {fmtShort(week.end)}</span>
-                </div>
-                {result.winners.length === 0 ? (
-                  <div className="text-xs text-[#222222]/50">No bids for this week.</div>
-                ) : (
-                  <div className="space-y-1">
-                    {result.winners.map((w, i) => (
-                      <div key={i} className="text-xs text-[#4a449c] flex items-center gap-1.5">
-                        <ChevronRight size={12} /> {radById(w.radId).name} won it for {w.points} points
-                      </div>
-                    ))}
-                  </div>
-                )}
-                {result.notWon.length > 0 && (
-                  <div className="mt-1.5 pt-1.5 border-t border-[#e6e7e8] space-y-1">
-                    {result.notWon.map((w, i) => (
-                      <div key={i} className="text-xs text-[#222222]/50 flex items-center gap-1.5">
-                        <X size={11} /> {radById(w.radId).name} bid {w.points} but didn't win (coverage limit) &mdash; points refunded
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-        <button onClick={startNextYearVacationDraft} className="flex items-center gap-1.5 bg-[#635cc6] hover:bg-[#4a449c] text-white text-sm font-medium px-4 py-2 rounded-md">
-          <Repeat size={14} /> Start {vacationAuction.year + 1} Draft
-        </button>
-      </div>
-    );
-  }
 
   return (
     <div className="max-w-2xl space-y-6">
@@ -1776,7 +1815,7 @@ function VacationDraftPanel({ currentUser, radById, vacationAuction, setVacation
           <h3 className="text-sm font-semibold text-[#211c35]">{vacationAuction.year} holiday-week priority draft</h3>
         </div>
         <p className="text-xs text-[#222222]/60 mb-3">
-          Everything outside these weeks still goes through the normal vacation request process. For these {HOLIDAY_WEEKS.length} high-demand weeks, spend your {ANNUAL_VACATION_POINTS}-point annual budget on whichever ones you actually want &mdash; bids are sealed, and only winning bids cost points.
+          Stage 1 of 2. Every one of your {REQUIRED_VACATION_WEEKS} required weeks now comes through this process &mdash; for these {HOLIDAY_WEEKS.length} high-demand weeks, spend your {ANNUAL_VACATION_POINTS}-point annual budget on whichever ones you actually want. Bids are sealed, and only winning bids cost points. Whatever you don't spend here carries you further up the pick order for your remaining weeks in Stage 2.
         </p>
         <div className="text-sm font-medium text-[#211c35]">
           {remaining} of {ANNUAL_VACATION_POINTS} points remaining
@@ -1809,10 +1848,197 @@ function VacationDraftPanel({ currentUser, radById, vacationAuction, setVacation
 
       <div className="bg-white border border-dashed border-[#966eed]/50 rounded-xl p-4">
         <div className="text-xs text-[#222222]/60 mb-2">In production this closes automatically once the bidding window ends. This prototype has no scheduler, so running the draft is a manual admin action.</div>
-        <button onClick={closeVacationDraft} className="flex items-center gap-1.5 text-xs bg-[#211c35] text-white rounded-md px-3 py-1.5">
-          <Scale size={12} /> Run Draft & Assign Weeks (admin)
+        <button onClick={closeHolidayBidding} className="flex items-center gap-1.5 text-xs bg-[#211c35] text-white rounded-md px-3 py-1.5">
+          <Scale size={12} /> Close Bidding & Start Stage 2 (admin)
         </button>
       </div>
+    </div>
+  );
+}
+
+function StandardPicksPhase({ currentUser, radById, vacationAuction, makeStandardPick, checkRange, vacationRequests }) {
+  const { draftOrder, weeksWon } = vacationAuction;
+  const turn = getCurrentTurn(vacationAuction);
+  const myWeeksWon = weeksWon[currentUser.id] || 0;
+  const isMyTurn = turn && turn.radId === currentUser.id;
+  const [pickError, setPickError] = useState(null);
+  const [calMonth, setCalMonth] = useState(0); // 0 = January of vacationAuction.year
+
+  const validWeekStarts = new Set(sundaysInYear(vacationAuction.year).map((w) => w.start));
+  const myDaysAlreadyOff = new Set(
+    vacationRequests.filter((v) => v.radId === currentUser.id && v.status === 'approved').flatMap((v) => v.days)
+  );
+  const gridWeeks = isMyTurn ? monthGridWeeks(vacationAuction.year, calMonth) : [];
+  const monthLabel = new Date(Date.UTC(vacationAuction.year, calMonth, 1)).toLocaleString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' });
+
+  return (
+    <div className="max-w-2xl space-y-6">
+      <div className="bg-white border border-[#e6e7e8] rounded-xl p-4">
+        <div className="flex items-center gap-2 mb-1">
+          <Repeat size={15} className="text-[#4a449c]" />
+          <h3 className="text-sm font-semibold text-[#211c35]">{vacationAuction.year} standard-week draft</h3>
+        </div>
+        <p className="text-xs text-[#222222]/60">
+          Stage 2 of 2. Draft order is set by leftover points from Stage 1. Each partner picks one week at a time, in order, until everyone reaches {REQUIRED_VACATION_WEEKS} weeks for the year. Every week runs Sunday&ndash;Saturday; click anywhere in a week's row to pick it. Struck-through weeks would break a coverage minimum and can't be picked.
+        </p>
+      </div>
+
+      <div className="bg-white border border-[#e6e7e8] rounded-xl p-4">
+        <div className="text-sm font-medium text-[#211c35] mb-2">Draft order</div>
+        <div className="space-y-1">
+          {draftOrder.map((radId, i) => {
+            const rad = radById(radId);
+            const won = weeksWon[radId] || 0;
+            const isTurn = turn && turn.radId === radId;
+            return (
+              <div key={radId} className={`flex items-center justify-between text-xs px-2 py-1.5 rounded-md ${isTurn ? 'bg-[#635cc6]/10 border border-[#635cc6]' : ''}`}>
+                <span className="flex items-center gap-2">
+                  <span className="text-[#222222]/40 w-5">{i + 1}.</span>
+                  <span className={isTurn ? 'font-semibold text-[#211c35]' : 'text-[#222222]/80'}>{rad.name}</span>
+                  {isTurn && <span className="text-[#635cc6] font-semibold">&larr; on the clock</span>}
+                </span>
+                <span className="text-[#222222]/60">{won}/{REQUIRED_VACATION_WEEKS} weeks</span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      <div className="bg-white border border-[#e6e7e8] rounded-xl p-4">
+        <div className="text-sm font-medium text-[#211c35] mb-2">Your progress: {myWeeksWon}/{REQUIRED_VACATION_WEEKS} weeks</div>
+        {isMyTurn ? (
+          <div>
+            <div className="flex items-center justify-between mb-3">
+              <button
+                onClick={() => setCalMonth((m) => Math.max(0, m - 1))}
+                disabled={calMonth === 0}
+                className="p-1.5 rounded-md border border-[#e6e7e8] disabled:opacity-30 hover:bg-[#f8f8f8]"
+              >
+                <ChevronLeft size={14} />
+              </button>
+              <div className="text-sm font-semibold text-[#211c35]">{monthLabel}</div>
+              <button
+                onClick={() => setCalMonth((m) => Math.min(11, m + 1))}
+                disabled={calMonth === 11}
+                className="p-1.5 rounded-md border border-[#e6e7e8] disabled:opacity-30 hover:bg-[#f8f8f8]"
+              >
+                <ChevronRight size={14} />
+              </button>
+            </div>
+
+            <div className="flex items-center gap-4 text-xs text-[#222222]/60 mb-2">
+              <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded bg-white border border-[#e6e7e8] inline-block" /> Available</span>
+              <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded bg-[#e6e7e8] inline-block" /> Unavailable</span>
+            </div>
+
+            <div className="grid grid-cols-7 gap-1 text-center text-xs text-[#222222]/50 mb-1">
+              {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((d) => <div key={d}>{d}</div>)}
+            </div>
+
+            <div className="space-y-1">
+              {gridWeeks.map((week) => {
+                const isValidStart = validWeekStarts.has(week[0]);
+                const overlapsMine = week.some((d) => myDaysAlreadyOff.has(d));
+                const violations = isValidStart && !overlapsMine ? checkRange(currentUser.id, week[0], week[6]) : [];
+                const blocked = !isValidStart || overlapsMine || violations.length > 0;
+                return (
+                  <button
+                    key={week[0]}
+                    disabled={blocked}
+                    onClick={() => {
+                      const err = makeStandardPick(currentUser.id, week[0], week[6]);
+                      if (err) setPickError(err);
+                    }}
+                    title={blocked ? (overlapsMine ? 'Overlaps a week you already have' : isValidStart ? 'Would break coverage minimums' : '') : ''}
+                    className={`w-full grid grid-cols-7 gap-1 rounded-md border px-1 py-1.5 ${
+                      blocked ? 'bg-[#e6e7e8] border-[#e6e7e8] cursor-not-allowed' : 'bg-white border-[#e6e7e8] hover:border-[#635cc6]'
+                    }`}
+                  >
+                    {week.map((d) => {
+                      const inMonth = new Date(d + 'T00:00:00Z').getUTCMonth() === calMonth;
+                      const dayNum = new Date(d + 'T00:00:00Z').getUTCDate();
+                      return (
+                        <span
+                          key={d}
+                          className={`text-xs ${blocked ? 'line-through text-[#222222]/30' : inMonth ? 'text-[#211c35]' : 'text-[#222222]/30'}`}
+                        >
+                          {dayNum}
+                        </span>
+                      );
+                    })}
+                  </button>
+                );
+              })}
+            </div>
+
+            {pickError && (
+              <div className="mt-3 flex items-center gap-2 text-xs text-[#966eed] bg-[#966eed]/10 rounded-md px-3 py-2">
+                <AlertTriangle size={14} /> {pickError}
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="text-xs text-[#222222]/60">Waiting for your turn &mdash; switch "Viewing as" to {radById(turn.radId).name} to make their pick and move the draft along.</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function VacationDraftClosed({ radById, vacationAuction, startNextYearVacationDraft }) {
+  const byPartner = {};
+  Object.values(vacationAuction.results).forEach((r) => {
+    r.winners.forEach((w) => {
+      byPartner[w.radId] = byPartner[w.radId] || { holiday: [], standard: [] };
+    });
+  });
+  HOLIDAY_WEEKS.forEach((week) => {
+    vacationAuction.results[week.id].winners.forEach((w) => {
+      byPartner[w.radId] = byPartner[w.radId] || { holiday: [], standard: [] };
+      byPartner[w.radId].holiday.push({ label: week.label, points: w.points });
+    });
+  });
+  vacationAuction.standardPicks.forEach((p) => {
+    byPartner[p.radId] = byPartner[p.radId] || { holiday: [], standard: [] };
+    byPartner[p.radId].standard.push(p);
+  });
+
+  return (
+    <div className="max-w-2xl space-y-6">
+      <div className="bg-white border border-[#e6e7e8] rounded-xl p-4">
+        <div className="flex items-center gap-2 mb-1">
+          <CheckCircle2 size={16} className="text-[#4a449c]" />
+          <h3 className="text-sm font-semibold text-[#211c35]">{vacationAuction.year} vacation-week draft &mdash; complete</h3>
+        </div>
+        <p className="text-xs text-[#222222]/60">Every partner has reached {REQUIRED_VACATION_WEEKS} weeks for the year. All weeks now live on the Vacation & Trades tab, where they can be swapped.</p>
+      </div>
+
+      <div className="space-y-2">
+        {Object.entries(byPartner).map(([radId, data]) => {
+          const rad = radById(radId);
+          return (
+            <div key={radId} className="bg-white border border-[#e6e7e8] rounded-xl p-4">
+              <div className="font-medium text-[#211c35] mb-2">{rad.name}</div>
+              <div className="space-y-1">
+                {data.holiday.map((h, i) => (
+                  <div key={'h' + i} className="text-xs text-[#4a449c] flex items-center gap-1.5">
+                    <ChevronRight size={12} /> {h.label} &mdash; won for {h.points} points
+                  </div>
+                ))}
+                {data.standard.map((s, i) => (
+                  <div key={'s' + i} className="text-xs text-[#222222]/70 flex items-center gap-1.5">
+                    <ChevronRight size={12} className="text-[#222222]/30" /> {fmtShort(s.start)} &ndash; {fmtShort(s.end)}
+                  </div>
+                ))}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      <button onClick={startNextYearVacationDraft} className="flex items-center gap-1.5 bg-[#635cc6] hover:bg-[#4a449c] text-white text-sm font-medium px-4 py-2 rounded-md">
+        <Repeat size={14} /> Start {vacationAuction.year + 1} Draft
+      </button>
     </div>
   );
 }
