@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Calendar, Users, AlertTriangle, CheckCircle2, MapPin, Wifi, Plus, X, ArrowRightLeft, ShieldCheck, ChevronRight, Scale, DollarSign, Gavel, History, TrendingUp, Ban, Tag, Repeat, EyeOff, Timer } from 'lucide-react';
+import { Calendar, Users, AlertTriangle, CheckCircle2, MapPin, Wifi, Plus, X, ArrowRightLeft, ShieldCheck, ChevronRight, Scale, DollarSign, Gavel, History, TrendingUp, Ban, Tag, Repeat, EyeOff, Timer, Bell } from 'lucide-react';
 
 // ---------- Static config ----------
 // NOTE: Cardiac and PET were added because they show up as subspecialties in the
