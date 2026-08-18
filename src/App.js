@@ -198,6 +198,49 @@ const fmtCountdownDays = (ms) => {
   return d > 0 ? `${d}d ${h}h remaining` : `${h}h remaining`;
 };
 
+// ---------- Annual vacation-week priority auction ----------
+// Unlike weekend call (fungible units, anonymous pooling), a specific vacation week matters
+// to the person requesting it, so this isn't a quantity auction. It's a sealed-bid priority
+// draft scoped to a defined set of high-demand holiday weeks — everything else still goes
+// through the normal Vacation & Trades request flow. Each partner gets a fixed annual points
+// budget to spend across whichever holiday weeks they actually care about; a losing bid costs
+// nothing (points aren't spent until you win). Capacity per week isn't a made-up seat count —
+// it's whatever the existing coverage-minimum engine actually allows, checked greedily from
+// the highest bidder down.
+// NOTE: these dates are placeholders — swap in the practice's actual observed holiday weeks.
+const ANNUAL_VACATION_POINTS = 100;
+const HOLIDAY_WEEKS = [
+  { id: 'newyears', label: "New Year's Week", start: '2027-01-01', end: '2027-01-03' },
+  { id: 'memorial', label: 'Memorial Day Week', start: '2027-05-29', end: '2027-05-31' },
+  { id: 'july4', label: 'Independence Day Week', start: '2027-07-04', end: '2027-07-06' },
+  { id: 'laborday', label: 'Labor Day Week', start: '2027-09-04', end: '2027-09-06' },
+  { id: 'thanksgiving', label: 'Thanksgiving Week', start: '2027-11-24', end: '2027-11-27' },
+  { id: 'christmas', label: "Christmas / New Year's Eve Week", start: '2027-12-24', end: '2027-12-27' },
+];
+
+function initialVacationAuction(year) {
+  return { year, phase: 'bidding', bids: [], results: null };
+}
+
+// Standalone (non-hook) coverage check so the greedy draft-clearing pass can evaluate each
+// candidate against an incrementally-growing working set of grants, independent of React state.
+function checkRangeAgainstPure(requests, radId, start, end) {
+  const rad = RADIOLOGISTS.find((r) => r.id === radId);
+  const violations = [];
+  dateRange(start, end).forEach((d) => {
+    rad.specialties.forEach((sp) => {
+      let count = 0;
+      RADIOLOGISTS.forEach((r) => {
+        if (!r.specialties.includes(sp) || r.id === radId) return;
+        const isOff = requests.some((v) => v.radId === r.id && (v.status === 'approved' || v.status === 'overridden') && v.days.includes(d));
+        if (!isOff) count++;
+      });
+      if (count < COVERAGE_MIN[sp]) violations.push({ date: d, specialty: sp, avail: count, min: COVERAGE_MIN[sp] });
+    });
+  });
+  return violations;
+}
+
 const badgeColor = 'bg-[#e6e7e8] text-[#211c35]';
 
 export default function App() {
@@ -214,6 +257,7 @@ export default function App() {
   const [proposalTarget, setProposalTarget] = useState(null); // id of board listing being proposed against
   const [proposalMyReq, setProposalMyReq] = useState('');
   const [annualAuction, setAnnualAuction] = useState(() => initialAnnualAuction(new Date().getFullYear() + 1));
+  const [vacationAuction, setVacationAuction] = useState(() => initialVacationAuction(new Date().getFullYear() + 1));
   const [sellQtyDraft, setSellQtyDraft] = useState(0);
   const [buyQtyDraft, setBuyQtyDraft] = useState(1);
   const [nowTick, setNowTick] = useState(Date.now());
@@ -523,6 +567,50 @@ export default function App() {
     setAnnualAuction((prev) => initialAnnualAuction(prev.year + 1));
   }
 
+  // ---------- Annual vacation-week priority auction ----------
+  function setVacationBid(radId, weekId, points) {
+    const clamped = Math.max(0, Math.floor(points) || 0);
+    setVacationAuction((prev) => {
+      if (prev.phase !== 'bidding') return prev;
+      const others = prev.bids.filter((b) => !(b.radId === radId && b.weekId === weekId));
+      const committedElsewhere = others.filter((b) => b.radId === radId).reduce((sum, b) => sum + b.points, 0);
+      const capped = Math.min(clamped, Math.max(0, ANNUAL_VACATION_POINTS - committedElsewhere));
+      const bids = capped > 0 ? [...others, { radId, weekId, points: capped, ts: Date.now() }] : others;
+      return { ...prev, bids };
+    });
+  }
+  function closeVacationDraft() {
+    setVacationAuction((prev) => {
+      if (prev.phase !== 'bidding') return prev;
+      let working = vacationRequests.map((v) => ({ ...v }));
+      const results = {};
+      HOLIDAY_WEEKS.forEach((week) => {
+        const weekBids = prev.bids.filter((b) => b.weekId === week.id).sort((a, b) => b.points - a.points || a.ts - b.ts);
+        const winners = [];
+        const notWon = [];
+        weekBids.forEach((b) => {
+          const viol = checkRangeAgainstPure(working, b.radId, week.start, week.end);
+          if (viol.length === 0) {
+            winners.push({ radId: b.radId, points: b.points });
+            working = [...working, {
+              id: 'v-draft-' + week.id + '-' + b.radId, radId: b.radId, start: week.start, end: week.end,
+              status: 'approved', openToTrade: false, days: dateRange(week.start, week.end),
+              flexibleDays: [], swapLog: [], source: 'vacation-draft', weekLabel: week.label,
+            }];
+          } else {
+            notWon.push({ radId: b.radId, points: b.points });
+          }
+        });
+        results[week.id] = { winners, notWon };
+      });
+      setVacationRequests(working);
+      return { ...prev, phase: 'closed', results };
+    });
+  }
+  function startNextYearVacationDraft() {
+    setVacationAuction((prev) => initialVacationAuction(prev.year + 1));
+  }
+
   const openAuctions = auctions.filter((a) => a.status === 'open').sort((x, y) => x.currentPrice - y.currentPrice);
 
   const settledAuctions = auctions.filter((a) => a.status !== 'open');
@@ -615,6 +703,8 @@ export default function App() {
               withdrawSellUnit={withdrawSellUnit} withdrawAllSellUnits={withdrawAllSellUnits} submitBuyRequest={submitBuyRequest}
               cancelBuyRequest={cancelBuyRequest} closeCurrentRound={closeCurrentRound}
               startNextYearAuction={startNextYearAuction}
+              vacationAuction={vacationAuction} setVacationBid={setVacationBid}
+              closeVacationDraft={closeVacationDraft} startNextYearVacationDraft={startNextYearVacationDraft}
             />
           )}
         </div>
@@ -1366,30 +1456,57 @@ function CoverageTab({ mapDays, coverageAvailable }) {
 function AnnualAuctionTab({
   currentUser, radById, nowTick, annualAuction, sellQtyDraft, setSellQtyDraft, buyQtyDraft, setBuyQtyDraft,
   setSellCommitment, startAnnualAuction, withdrawSellUnit, withdrawAllSellUnits, submitBuyRequest, cancelBuyRequest, closeCurrentRound, startNextYearAuction,
+  vacationAuction, setVacationBid, closeVacationDraft, startNextYearVacationDraft,
 }) {
+  const [subTab, setSubTab] = useState('call');
   const isPartner = PARTNER_TITLES.includes(currentUser.title);
 
   if (!isPartner) {
     return (
       <div className="max-w-2xl bg-white border border-[#e6e7e8] rounded-xl p-5 text-sm text-[#222222]/70">
-        The annual weekend-call auction applies to partner radiologists (MD/DO). {currentUser.name} isn't enrolled in weekend call under the current roster settings.
+        These annual auctions apply to partner radiologists (MD/DO). {currentUser.name} isn't enrolled under the current roster settings.
       </div>
     );
   }
 
-  if (annualAuction.phase === 'enrollment') {
-    return <EnrollmentPhase currentUser={currentUser} annualAuction={annualAuction} sellQtyDraft={sellQtyDraft} setSellQtyDraft={setSellQtyDraft} setSellCommitment={setSellCommitment} startAnnualAuction={startAnnualAuction} />;
-  }
-  if (annualAuction.phase === 'closed') {
-    return <ResultsReport radById={radById} annualAuction={annualAuction} startNextYearAuction={startNextYearAuction} />;
-  }
   return (
-    <LiveAuctionPhase
-      currentUser={currentUser} nowTick={nowTick} annualAuction={annualAuction}
-      buyQtyDraft={buyQtyDraft} setBuyQtyDraft={setBuyQtyDraft}
-      withdrawSellUnit={withdrawSellUnit} withdrawAllSellUnits={withdrawAllSellUnits} submitBuyRequest={submitBuyRequest}
-      cancelBuyRequest={cancelBuyRequest} closeCurrentRound={closeCurrentRound}
-    />
+    <div>
+      <div className="flex gap-2 mb-5">
+        <button
+          onClick={() => setSubTab('call')}
+          className={`text-sm font-medium px-3 py-1.5 rounded-md ${subTab === 'call' ? 'bg-[#635cc6] text-white' : 'bg-white border border-[#e6e7e8] text-[#211c35]'}`}
+        >
+          Weekend Call
+        </button>
+        <button
+          onClick={() => setSubTab('vacation')}
+          className={`text-sm font-medium px-3 py-1.5 rounded-md ${subTab === 'vacation' ? 'bg-[#635cc6] text-white' : 'bg-white border border-[#e6e7e8] text-[#211c35]'}`}
+        >
+          Vacation Weeks
+        </button>
+      </div>
+
+      {subTab === 'call' ? (
+        annualAuction.phase === 'enrollment' ? (
+          <EnrollmentPhase currentUser={currentUser} annualAuction={annualAuction} sellQtyDraft={sellQtyDraft} setSellQtyDraft={setSellQtyDraft} setSellCommitment={setSellCommitment} startAnnualAuction={startAnnualAuction} />
+        ) : annualAuction.phase === 'closed' ? (
+          <ResultsReport radById={radById} annualAuction={annualAuction} startNextYearAuction={startNextYearAuction} />
+        ) : (
+          <LiveAuctionPhase
+            currentUser={currentUser} nowTick={nowTick} annualAuction={annualAuction}
+            buyQtyDraft={buyQtyDraft} setBuyQtyDraft={setBuyQtyDraft}
+            withdrawSellUnit={withdrawSellUnit} withdrawAllSellUnits={withdrawAllSellUnits} submitBuyRequest={submitBuyRequest}
+            cancelBuyRequest={cancelBuyRequest} closeCurrentRound={closeCurrentRound}
+          />
+        )
+      ) : (
+        <VacationDraftPanel
+          currentUser={currentUser} radById={radById} vacationAuction={vacationAuction}
+          setVacationBid={setVacationBid} closeVacationDraft={closeVacationDraft}
+          startNextYearVacationDraft={startNextYearVacationDraft}
+        />
+      )}
+    </div>
   );
 }
 
@@ -1592,6 +1709,110 @@ function ResultsReport({ radById, annualAuction, startNextYearAuction }) {
       <button onClick={startNextYearAuction} className="flex items-center gap-1.5 bg-[#635cc6] hover:bg-[#4a449c] text-white text-sm font-medium px-4 py-2 rounded-md">
         <Repeat size={14} /> Start {annualAuction.year + 1} Enrollment
       </button>
+    </div>
+  );
+}
+
+function VacationDraftPanel({ currentUser, radById, vacationAuction, setVacationBid, closeVacationDraft, startNextYearVacationDraft }) {
+  const myBids = vacationAuction.bids.filter((b) => b.radId === currentUser.id);
+  const committed = myBids.reduce((sum, b) => sum + b.points, 0);
+  const remaining = ANNUAL_VACATION_POINTS - committed;
+
+  if (vacationAuction.phase === 'closed') {
+    return (
+      <div className="max-w-2xl space-y-6">
+        <div className="bg-white border border-[#e6e7e8] rounded-xl p-4">
+          <div className="flex items-center gap-2 mb-1">
+            <CheckCircle2 size={16} className="text-[#4a449c]" />
+            <h3 className="text-sm font-semibold text-[#211c35]">{vacationAuction.year} vacation-week draft &mdash; results</h3>
+          </div>
+          <p className="text-xs text-[#222222]/60">Points spent only count toward weeks you actually won &mdash; a losing bid costs nothing.</p>
+        </div>
+        <div className="space-y-2">
+          {HOLIDAY_WEEKS.map((week) => {
+            const result = vacationAuction.results[week.id];
+            return (
+              <div key={week.id} className="bg-white border border-[#e6e7e8] rounded-xl p-4">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="font-medium text-[#211c35]">{week.label}</span>
+                  <span className="text-xs text-[#222222]/50">{fmtShort(week.start)} &ndash; {fmtShort(week.end)}</span>
+                </div>
+                {result.winners.length === 0 ? (
+                  <div className="text-xs text-[#222222]/50">No bids for this week.</div>
+                ) : (
+                  <div className="space-y-1">
+                    {result.winners.map((w, i) => (
+                      <div key={i} className="text-xs text-[#4a449c] flex items-center gap-1.5">
+                        <ChevronRight size={12} /> {radById(w.radId).name} won it for {w.points} points
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {result.notWon.length > 0 && (
+                  <div className="mt-1.5 pt-1.5 border-t border-[#e6e7e8] space-y-1">
+                    {result.notWon.map((w, i) => (
+                      <div key={i} className="text-xs text-[#222222]/50 flex items-center gap-1.5">
+                        <X size={11} /> {radById(w.radId).name} bid {w.points} but didn't win (coverage limit) &mdash; points refunded
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+        <button onClick={startNextYearVacationDraft} className="flex items-center gap-1.5 bg-[#635cc6] hover:bg-[#4a449c] text-white text-sm font-medium px-4 py-2 rounded-md">
+          <Repeat size={14} /> Start {vacationAuction.year + 1} Draft
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="max-w-2xl space-y-6">
+      <div className="bg-white border border-[#e6e7e8] rounded-xl p-4">
+        <div className="flex items-center gap-2 mb-1">
+          <Repeat size={15} className="text-[#4a449c]" />
+          <h3 className="text-sm font-semibold text-[#211c35]">{vacationAuction.year} holiday-week priority draft</h3>
+        </div>
+        <p className="text-xs text-[#222222]/60 mb-3">
+          Everything outside these weeks still goes through the normal vacation request process. For these {HOLIDAY_WEEKS.length} high-demand weeks, spend your {ANNUAL_VACATION_POINTS}-point annual budget on whichever ones you actually want &mdash; bids are sealed, and only winning bids cost points.
+        </p>
+        <div className="text-sm font-medium text-[#211c35]">
+          {remaining} of {ANNUAL_VACATION_POINTS} points remaining
+        </div>
+      </div>
+
+      <div className="space-y-2">
+        {HOLIDAY_WEEKS.map((week) => {
+          const myBid = myBids.find((b) => b.weekId === week.id);
+          const maxForThisWeek = remaining + (myBid ? myBid.points : 0);
+          return (
+            <div key={week.id} className="bg-white border border-[#e6e7e8] rounded-lg px-4 py-3 flex items-center justify-between text-sm">
+              <div>
+                <div className="font-medium text-[#211c35]">{week.label}</div>
+                <div className="text-xs text-[#222222]/60">{fmtShort(week.start)} &ndash; {fmtShort(week.end)}</div>
+              </div>
+              <div className="flex items-center gap-2">
+                <label className="text-xs text-[#222222]/60">Points</label>
+                <input
+                  type="number" min={0} max={maxForThisWeek}
+                  value={myBid ? myBid.points : 0}
+                  onChange={(e) => setVacationBid(currentUser.id, week.id, Number(e.target.value))}
+                  className="w-20 border border-[#e6e7e8] rounded-md px-2 py-1.5 text-sm"
+                />
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="bg-white border border-dashed border-[#966eed]/50 rounded-xl p-4">
+        <div className="text-xs text-[#222222]/60 mb-2">In production this closes automatically once the bidding window ends. This prototype has no scheduler, so running the draft is a manual admin action.</div>
+        <button onClick={closeVacationDraft} className="flex items-center gap-1.5 text-xs bg-[#211c35] text-white rounded-md px-3 py-1.5">
+          <Scale size={12} /> Run Draft & Assign Weeks (admin)
+        </button>
+      </div>
     </div>
   );
 }
